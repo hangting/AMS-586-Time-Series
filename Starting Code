@@ -1,0 +1,16 @@
+data_file <- file.path("MacroTrends_Data_Download_AAPL.csv")
+
+apple_data <- read.csv(data_file, stringsAsFactors = FALSE)
+
+head(apple_data, 10)
+# Check the dimensions
+dim(apple_data)
+
+# Check column names
+names(apple_data)
+
+# Check variable types
+str(apple_data)
+
+# Summary statistics
+summary(apple_data)
