@@ -1,0 +1,1831 @@
+---
+title: "Store Sales: Statistical Time-Series Analysis and Forecasting"
+author: "AMS 586"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 1
+  html_document:
+    toc: true
+    toc_depth: 1
+abstract: |
+  This report studies grocery sales at aggregate and store-family levels,
+  then develops interpretable 16-day forecasts using regression with SARIMA
+  errors. It distinguishes missing calendar dates from genuine zero sales,
+  evaluates trend and seasonality with STL, ACF/PACF and stationarity tests,
+  and checks one-step innovations and model stability. Final estimation uses
+  all observed training history; a bounded likelihood-based search and explicit
+  fallbacks cover every test series. Remaining dependence and the absence of
+  observed test targets limit claims about model adequacy and Kaggle accuracy.
+fontsize: 12pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{booktabs}
+  - \newsavebox{\reporttablebox}
+  - \raggedbottom
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 7, fig.height = 4.5, dev.args = list(pointsize = 11), out.width = "100%", fig.align = "center", comment = NA,
+                      warning = TRUE, message = FALSE)
+if (!requireNamespace("urca", quietly = TRUE))
+  stop("Install the required package with install.packages('urca').")
+options(width = 110)
+report_series_label <- function(x) {
+  old <- c("Seasonally adjusted log total", "Differenced adjusted log total", "Example training log sales", "Example first difference", "Example weekly difference")
+  new <- c("Adjusted log", "Diff. adjusted log", "Example log", "Example first diff.", "Example weekly diff.")
+  for (i in seq_along(old)) x <- gsub(old[i], new[i], x, fixed = TRUE)
+  x
+}
+# Presentation helpers only: never used by model fitting or forecasting.
+report_table <- function(x, title = NULL, digits = 3, col.names = names(x), alignment = NULL) {
+  old_na <- getOption("knitr.kable.NA"); options(knitr.kable.NA = "--")
+  on.exit(options(knitr.kable.NA = old_na), add = TRUE)
+  if (knitr::is_latex_output()) {
+    cat("\n\n\\par\\noindent\\begin{minipage}{\\linewidth}\n")
+    if (!is.null(title)) cat("\\textbf{", knitr:::escape_latex(title), "}\\par\\smallskip\n", sep = "")
+    tab <- as.character(knitr::kable(x, format = "latex", booktabs = TRUE,
+      digits = digits, col.names = col.names, row.names = FALSE, linesep = "", escape = TRUE))
+    if (!is.null(alignment)) {
+      lines <- strsplit(tab, "\n", fixed = TRUE)[[1]]
+      j <- grep("\\begin{tabular}", lines, fixed = TRUE)
+      lines[j] <- paste0("\\begin{tabular}{", alignment, "}")
+      tab <- paste(lines, collapse = "\n")
+    }
+    cat("\\begin{center}\n\\begingroup\\small\n\\sbox{\\reporttablebox}{%\n", tab,
+        "}\n\\ifdim\\wd\\reporttablebox>\\linewidth\n",
+        "\\resizebox{\\linewidth}{!}{\\usebox{\\reporttablebox}}\n",
+        "\\else\\usebox{\\reporttablebox}\\fi\n\\endgroup\n\\end{center}\n",
+        "\\end{minipage}\\par\\medskip\n\n", sep = "")
+  } else {
+    if (!is.null(title)) cat("\n\n**", title, "**\n\n", sep = "")
+    cat(as.character(knitr::kable(x, format = "pipe", digits = digits,
+      col.names = col.names, row.names = FALSE)), "\n\n")
+  }
+  invisible(x)
+}
+report_p <- function(p) format.pval(p, digits = 3, eps = .001)
+report_decision <- function(x) ifelse(x, "R", "NR")
+report_stationarity <- function(tab, title = "Stationarity tests at 5%") {
+  groups <- split(seq_len(nrow(tab)), factor(tab$series, levels = unique(tab$series)))
+  out <- do.call(rbind, lapply(groups, function(i) {
+    z <- tab[i, ]; a <- z[1, ]; short <- z[z$KPSS_bandwidth == "short", ][1, ]
+    long <- z[z$KPSS_bandwidth == "long", ][1, ]
+    data.frame(Series = report_series_label(a$series),
+      Terms = if (a$deterministic == "intercept + trend") "Trend" else "Constant",
+      ADF = sprintf("%.3f (%d)", a$ADF_stat, a$ADF_lag),
+      `ADF 5%` = report_decision(a$ADF_reject),
+      `KPSS short` = sprintf("%.3f (%d)", short$KPSS_stat, short$KPSS_lag),
+      `KPSS long` = sprintf("%.3f (%d)", long$KPSS_stat, long$KPSS_lag),
+      `KPSS S/L` = paste(report_decision(short$KPSS_reject), report_decision(long$KPSS_reject), sep = "/"),
+      check.names = FALSE)
+  }))
+  report_table(out, title, digits = 3)
+  critical <- unique(tab[c("deterministic", "ADF_critical_5pct", "KPSS_critical_5pct")])
+  cat("R = reject; NR = do not reject. Parentheses give the selected ADF lag or KPSS bandwidth. ")
+  cat("Trend includes an intercept. Critical values (ADF / KPSS): ",
+    paste(sprintf("%s: %.3f / %.3f", critical$deterministic,
+      critical$ADF_critical_5pct, critical$KPSS_critical_5pct), collapse = "; "), ".\n\n", sep = "")
+  invisible(out)
+}
+report_orders <- function(f) {
+  if (inherits(f, "lm")) return("iid")
+  a <- f$arma
+  sprintf("(%d,%d,%d)(%d,%d,%d)", a[1], a[6], a[2], a[3], a[7], a[4])
+}
+report_model_comparison <- function(detail) {
+  models <- unique(c("M1", "M1_raw", "M2", "M3_base", detail$selected))
+  tab <- do.call(rbind, lapply(models, function(m) {
+    f <- detail$result$fits[[m]]
+    if (is.null(f)) return(NULL)
+    raw <- identical(m, "M1_raw")
+    if (inherits(f, "lm")) {
+      k <- attr(logLik(f), "df"); n <- nobs(f)
+      aicc <- if (raw) NA_real_ else AIC(f) + 2 * k * (k + 1) / (n - k - 1)
+      bic <- if (raw) NA_real_ else BIC(f)
+      conv <- "OLS"
+    } else { aicc <- f$aicc; bic <- f$bic; conv <- as.character(f$code) }
+    cn <- names(coef(f))
+    K <- if (any(grepl("annual_sin3", cn, fixed = TRUE))) 3L else
+      if (any(grepl("annual_sin2", cn, fixed = TRUE))) 2L else
+      if (any(grepl("annual_sin", cn, fixed = TRUE))) 1L else NA_integer_
+    d <- detail$result$diagnostics[[m]]
+    pv <- function(h) if (!is.null(d) && nrow(d)) d$p_value[match(h, d$lag)] else NA_real_
+    data.frame(Model = m, Errors = report_orders(f), K = K,
+      AICc = round(aicc, 2), BIC = round(bic, 2), Conv. = conv,
+      `LB 14` = report_p(pv(14)), `LB 28` = report_p(pv(28)), check.names = FALSE)
+  }))
+  report_table(tab, "Representative fitted-model comparison (seasonal period 7)", digits = 2)
+  cat("Convergence code 0 denotes successful numerical optimization. Raw-scale OLS information criteria are omitted because its response scale differs. ")
+  cat("Compare criteria only for the same response data and differencing/likelihood convention.\n\n")
+  eligible <- !tab$Model %in% c("M1", "M1_raw")
+  if (any(eligible)) cat("Among these SARIMA specifications, AICc favors **",
+    tab$Model[which(eligible)[which.min(tab$AICc[eligible])]], "**; BIC favors **",
+    tab$Model[which(eligible)[which.min(tab$BIC[eligible])]],
+    "**. This expresses an in-sample fit/complexity tradeoff, not an accuracy comparison.\n\n", sep = "")
+  invisible(tab)
+}
+```
+
+\clearpage
+
+# 1. Data and quality checks
+
+Daily sales are forecast for individual store-product-family combinations over
+August 16-31, 2017. All available training observations through August 15 are
+used for final fitting. Test data supply only identifiers, dates and known
+promotion counts; hidden test sales and unavailable future transactions/oil
+prices are not used. No validation split is introduced.
+
+```{r read-data, include=FALSE}
+data_dir <- Sys.getenv("STORE_SALES_DATA", "store-sales-time-series-forecasting")
+if (!dir.exists(data_dir)) stop("Knit from the Kaggle folder containing the data directory.")
+csv_files <- sort(list.files(data_dir, pattern = "\\.csv$", full.names = TRUE))
+datasets <- setNames(lapply(csv_files, function(path) {
+  x <- read.csv(path, stringsAsFactors = FALSE)
+  if ("date" %in% names(x)) x$date <- as.Date(x$date)
+  x
+}), tools::file_path_sans_ext(basename(csv_files)))
+required <- c("train", "test", "stores", "oil", "holidays_events",
+              "transactions", "sample_submission")
+stopifnot(all(required %in% names(datasets)))
+train <- datasets$train; test <- datasets$test; stores <- datasets$stores
+oil <- datasets$oil; holidays_events <- datasets$holidays_events
+transactions <- datasets$transactions; sample_submission <- datasets$sample_submission
+inventory <- data.frame(dataset = names(datasets),
+  rows = vapply(datasets, nrow, integer(1)),
+  columns = vapply(datasets, ncol, integer(1)),
+  column_names = vapply(datasets, function(x) paste(names(x), collapse = ", "), ""))
+knitr::kable(inventory, row.names = FALSE)
+```
+
+```{r report-inventory, results='asis'}
+report_inventory <- inventory
+report_inventory$dataset <- gsub("_", " ", report_inventory$dataset)
+report_table(report_inventory, "Input datasets", col.names = c("Dataset", "Rows", "Columns", "Column names"),
+  alignment = "p{2.7cm}rrp{8.1cm}")
+```
+
+```{r missing-values-and-duplicates, include=FALSE}
+missingness <- do.call(rbind, lapply(names(datasets), function(nm) {
+  x <- datasets[[nm]]
+  data.frame(dataset = nm, column = names(x), missing = colSums(is.na(x)),
+             percent = 100 * colSums(is.na(x)) / nrow(x), row.names = NULL)
+}))
+knitr::kable(missingness, digits = 3, row.names = FALSE)
+keys <- list(train = c("date", "store_nbr", "family"),
+  test = c("date", "store_nbr", "family"), stores = "store_nbr", oil = "date",
+  holidays_events = c("date", "type", "locale", "locale_name", "description", "transferred"),
+  transactions = c("date", "store_nbr"), sample_submission = "id")
+duplicate_report <- do.call(rbind, lapply(names(keys), function(nm) {
+  x <- datasets[[nm]]
+  data.frame(dataset = nm, key = paste(keys[[nm]], collapse = ", "),
+    duplicate_key_rows = sum(duplicated(x[keys[[nm]]])),
+    exact_duplicate_rows = sum(duplicated(x)))
+}))
+knitr::kable(duplicate_report, row.names = FALSE)
+id_duplicates <- data.frame(dataset = c("train", "test", "sample_submission"),
+  duplicated_id = sapply(datasets[c("train", "test", "sample_submission")],
+                         function(x) sum(duplicated(x$id))))
+knitr::kable(id_duplicates, row.names = FALSE)
+# Duplicated training keys would make aggregate totals ambiguous.
+if (duplicate_report$duplicate_key_rows[duplicate_report$dataset == "train"] > 0L)
+  stop("Resolve duplicate training keys before continuing.")
+```
+```{r date-continuity, include=FALSE}
+dated_names <- names(datasets)[vapply(datasets, function(x) "date" %in% names(x), TRUE)]
+missing_dates <- setNames(lapply(dated_names, function(nm) {
+  d <- sort(unique(na.omit(datasets[[nm]]$date)))
+  seq(min(d), max(d), by = "day")[!seq(min(d), max(d), by = "day") %in% d]
+}), dated_names)
+coverage <- do.call(rbind, lapply(dated_names, function(nm) {
+  d <- datasets[[nm]]$date
+  data.frame(dataset = nm, start = min(d, na.rm = TRUE), end = max(d, na.rm = TRUE),
+    observed_dates = length(unique(na.omit(d))), missing_calendar_dates = length(missing_dates[[nm]]),
+    missing_date_values = sum(is.na(d)))
+}))
+knitr::kable(coverage, row.names = FALSE)
+# Lists the actual missing dates, not only their counts.
+lapply(missing_dates, as.character)
+```
+
+```{r report-data-quality, results='asis'}
+report_table(missingness[missingness$missing > 0, ], "Columns with missing values", digits = 2,
+  col.names = c("Dataset", "Column", "Missing", "Percent"))
+cat(sprintf("All other %d columns have zero missing values. Missing sales are never filled with zero; genuine zero sales remain observations.\n\n",
+  sum(missingness$missing == 0)))
+report_duplicates <- duplicate_report
+report_duplicates$dataset <- gsub("_", " ", report_duplicates$dataset)
+report_duplicates$key <- c("Event descriptors", "Date", "ID", "Store", "Date/store/family", "Date/store/family", "Date/store")[match(report_duplicates$dataset,
+  c("holidays events", "oil", "sample submission", "stores", "test", "train", "transactions"))]
+report_table(report_duplicates, "Duplicate-record checks", col.names = c("Dataset", "Key", "Extra key rows", "Exact duplicates"))
+cat("Holiday keys use date, type, locale, locale name, description and transfer status; multiple events on one date need not be duplicates. ")
+cat(paste(sprintf("%s ID duplicates: %d", id_duplicates$dataset, id_duplicates$duplicated_id), collapse = "; "), ".\n\n", sep = "")
+report_coverage <- coverage
+report_coverage$dataset <- gsub("_", " ", report_coverage$dataset)
+report_table(report_coverage, "Date coverage and absent calendar dates", col.names = c("Dataset", "First date", "Last date", "Dates", "Absent dates", "Missing date values"))
+cat("**Absent training dates:** ", paste(as.character(missing_dates$train), collapse = ", "), ".\n\n", sep = "")
+```
+
+The holiday table records events rather than a daily measurement process, and
+oil observations are not expected on every calendar date. Their absent-date
+counts are retained above, but exhaustive date lists do not identify additional
+data errors. Missing dates, missing recorded values and observed zeros are
+separate concepts throughout the analysis.
+
+```{r aggregate-sales-and-completeness, include=FALSE}
+valid_identity <- complete.cases(train[c("date", "store_nbr", "family")])
+cat("Training rows omitted for missing date/store/family:", sum(!valid_identity), "\n")
+t <- train[valid_identity, ]
+cat("Rows with missing sales:", sum(is.na(t$sales)),
+    "; actual zero-sales rows preserved:", sum(t$sales == 0, na.rm = TRUE), "\n")
+pairs <- unique(t[c("store_nbr", "family")])
+expected_pairs <- nrow(pairs)
+# A daily total is retained only when all expected series have observed sales.
+# An incomplete day's partial sum is not an estimate of its total.
+by_date <- split(seq_len(nrow(t)), t$date)
+daily <- do.call(rbind, lapply(by_date, function(i) {
+  x <- t[i, ]
+  data.frame(date = x$date[1], rows = nrow(x), missing_sales = sum(is.na(x$sales)),
+    sales = if (nrow(x) == expected_pairs && !anyNA(x$sales)) sum(x$sales) else NA_real_,
+    promotion = if (nrow(x) == expected_pairs && !anyNA(x$onpromotion)) sum(x$onpromotion) else NA_real_)
+}))
+calendar <- data.frame(date = seq(min(daily$date), max(daily$date), by = "day"))
+daily_sales <- merge(calendar, daily, by = "date", all.x = TRUE, sort = TRUE)
+cat("Missing calendar dates:", sum(is.na(daily_sales$rows)),
+    "; observed but incomplete sales days:", sum(!is.na(daily_sales$rows) & is.na(daily_sales$sales)),
+    "; days omitted from complete-day summaries:", sum(is.na(daily_sales$sales)), "\n")
+longest_segment <- function(date, value) {
+  stopifnot(!is.unsorted(date), !anyDuplicated(date))
+  good <- !is.na(value)
+  runs <- rle(good)
+  ends <- cumsum(runs$lengths)
+  candidates <- which(runs$values)
+  if (!length(candidates)) stop("No complete observations.")
+  k <- candidates[which.max(runs$lengths[candidates])]
+  i <- seq.int(ends[k] - runs$lengths[k] + 1L, ends[k])
+  stopifnot(all(diff(as.numeric(date[i])) == 1))
+  list(index = i, date = date[i], value = value[i], omitted = length(value) - length(i))
+}
+segment <- longest_segment(daily_sales$date, daily_sales$sales)
+cat("Regular analysis segment:", as.character(min(segment$date)), "through",
+    as.character(max(segment$date)), "; n =", length(segment$value),
+    "; dates outside segment =", segment$omitted, "\n")
+stopifnot(length(segment$value) >= 60)
+```
+```{r descriptive-statistics, include=FALSE}
+describe <- function(x) {
+  omitted <- sum(is.na(x)); x <- x[!is.na(x)]
+  c(n = length(x), omitted = omitted, mean = mean(x), median = median(x),
+    variance = var(x), sd = sd(x), minimum = min(x),
+    Q1 = unname(quantile(x, .25)), Q3 = unname(quantile(x, .75)), maximum = max(x))
+}
+knitr::kable(rbind(training_record_sales = describe(train$sales),
+                   daily_total_sales = describe(daily_sales$sales)), digits = 3)
+zero_days <- daily_sales[!is.na(daily_sales$sales) & daily_sales$sales == 0, c("date", "sales")]
+cat("Days with observed zero total sales:", nrow(zero_days), "\n")
+knitr::kable(zero_days, row.names = FALSE)
+```
+
+```{r report-sales-summary, results='asis'}
+report_desc <- rbind(training_record_sales = describe(train$sales), daily_total_sales = describe(daily_sales$sales))
+report_desc_display <- data.frame(Statistic = colnames(report_desc), check.names = FALSE)
+for (j in seq_len(nrow(report_desc))) report_desc_display[[c("Record sales", "Daily total")[j]]] <-
+  ifelse(colnames(report_desc) %in% c("n", "omitted"), format(round(report_desc[j, ]), big.mark = ",", trim = TRUE),
+         formatC(report_desc[j, ], format = "g", digits = 5))
+report_table(report_desc_display, "Record-level and aggregate daily sales summaries")
+cat(sprintf("Training rows omitted for missing date/store/family: %d; rows with missing sales: %d; genuine zero-sales records retained: %s. ",
+  sum(!valid_identity), sum(is.na(t$sales)), format(sum(t$sales == 0, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("Observed days with zero aggregate sales: %d. Incomplete/absent daily totals: %d.\n\n", nrow(zero_days), sum(is.na(daily_sales$sales))))
+cat(sprintf("**Regular EDA segment:** %s to %s (%d consecutive daily observations). It excludes %d observed daily totals outside that segment. ",
+  min(segment$date), max(segment$date), length(segment$value), sum(!is.na(daily_sales$sales) & !daily_sales$date %in% segment$date)))
+cat("The one-year EDA segment is not assumed representative of the whole history. **Final forecasting retains the complete training calendar**, treating absent targets as NA in the state-space likelihood, not as zero.\n\n")
+```
+
+# 2. Aggregate exploratory analysis
+
+```{r plot-sales, echo=FALSE, fig.height=4}
+plot(daily_sales$date, daily_sales$sales, type = "l", col = "steelblue",
+     main = "Daily Total Sales: All Stores and Families", xlab = "Date", ylab = "Sales (units)")
+```
+
+The aggregate trajectory shows changing sales levels and pronounced calendar
+variation. Distributional and mean-variance comparisons motivate, but do not
+prove the adequacy of, a logarithmic transformation.
+
+```{r sales-distribution-and-transformation, echo=FALSE, results='hide', fig.height=6.4}
+stopifnot(all(na.omit(daily_sales$sales) >= 0))
+par(mfrow = c(2, 2))
+hist(daily_sales$sales, breaks = 45, col = "grey80", main = "Distribution of Daily Total Sales", xlab = "Sales (units)")
+hist(log1p(daily_sales$sales), breaks = 45, col = "grey80", main = "Distribution of log(1 + Sales)", xlab = "log(1 + daily sales)")
+plot(daily_sales$date, log1p(daily_sales$sales), type = "l", main = "Transformed Daily Sales", xlab = "Date", ylab = "log(1 + sales)")
+monthly_group <- format(daily_sales$date, "%Y-%m")
+monthly_scale <- do.call(rbind, lapply(split(daily_sales$sales, monthly_group), function(x) {
+  x <- na.omit(x)
+  c(mean = mean(x), sd = sd(x), log_sd = sd(log1p(x)))
+}))
+plot(monthly_scale[, "mean"], monthly_scale[, "sd"], pch = 16,
+     main = "Monthly Mean versus Standard Deviation", xlab = "Monthly mean sales", ylab = "Monthly SD sales")
+par(mfrow = c(1, 1))
+cat("Correlation of monthly raw mean and SD:", cor(monthly_scale[, "mean"], monthly_scale[, "sd"], use = "complete.obs"), "\n")
+```
+
+```{r report-variance-note, results='asis'}
+cat(sprintf("The correlation between monthly mean and standard deviation is %.3f. The log1p transformation preserves zero sales and compresses large observations; residual variance is assessed again after fitting.\n\n",
+ cor(monthly_scale[, "mean"], monthly_scale[, "sd"], use = "complete.obs")))
+```
+
+```{r calendar-grouping, echo=FALSE, results='hide', fig.height=6.2}
+complete_daily <- daily_sales[!is.na(daily_sales$sales), ]
+complete_daily$weekday <- factor(as.integer(format(complete_daily$date, "%u")),
+  levels = 1:7, labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+complete_daily$month <- as.integer(format(complete_daily$date, "%m"))
+complete_daily$year <- format(complete_daily$date, "%Y")
+par(mfrow = c(2, 2))
+boxplot(sales ~ weekday, data = complete_daily, main = "Daily Sales by Weekday", xlab = "Weekday", ylab = "Sales (units)")
+boxplot(log1p(sales) ~ weekday, data = complete_daily, main = "Log Sales by Weekday", xlab = "Weekday", ylab = "log(1 + sales)")
+month_means <- aggregate(sales ~ month, complete_daily, mean)
+year_means <- aggregate(sales ~ year, complete_daily, mean)
+barplot(month_means$sales, names.arg = month.abb[month_means$month], main = "Average Daily Sales by Month", ylab = "Mean sales", las = 2)
+barplot(year_means$sales, names.arg = year_means$year, main = "Average Daily Sales by Year", ylab = "Mean sales")
+par(mfrow = c(1, 1))
+month_year_means <- aggregate(sales ~ year + month, complete_daily, mean)
+month_year_counts <- aggregate(sales ~ year + month, complete_daily, length)
+stopifnot(identical(month_year_means[c("year", "month")], month_year_counts[c("year", "month")]))
+month_year_means$n_days <- month_year_counts$sales
+knitr::kable(month_year_means, digits = 2, row.names = FALSE)
+```
+
+Weekday differences suggest weekly structure, examined with ACF/STL below.
+Monthly/yearly averages also mix trend, calendar composition and partial-year
+coverage, so they are descriptive rather than separate seasonal-effect estimates.
+
+```{r unusual-days-and-holidays, include=FALSE}
+# Tukey fences flag extremes, without declaring them errors or deleting them.
+q <- quantile(complete_daily$sales, c(.25, .75))
+fences <- q + c(-1.5, 1.5) * diff(q)
+flag <- complete_daily$sales < fences[1] | complete_daily$sales > fences[2]
+cat("Daily totals outside 1.5-IQR fences:", sum(flag), "; none removed.\n")
+# Changes are computed only between adjacent calendar days with observed totals.
+daily_sales$change <- c(NA_real_, diff(daily_sales$sales))
+daily_sales$percent_change <- c(NA_real_, 100 * diff(daily_sales$sales) / head(daily_sales$sales, -1))
+daily_sales$percent_change[!is.finite(daily_sales$percent_change)] <- NA_real_
+h <- holidays_events[!is.na(holidays_events$date), ]
+holiday_labels <- tapply(paste(h$type, h$locale, h$locale_name, h$description,
+                               paste0("transferred=", h$transferred)), h$date,
+                         function(x) paste(unique(x), collapse = "; "))
+label_days <- function(x) {
+  x$holiday_records <- unname(holiday_labels[as.character(x$date)])
+  x$weekday <- weekdays(x$date)
+  x
+}
+low_high <- unique(c(head(order(complete_daily$sales), 8), head(order(-complete_daily$sales), 8)))
+knitr::kable(label_days(complete_daily[low_high, c("date", "sales")]), row.names = FALSE)
+drops <- daily_sales[order(daily_sales$percent_change, na.last = NA), ]
+knitr::kable(label_days(head(drops[c("date", "sales", "percent_change")], 12)), digits = 2, row.names = FALSE)
+boundary <- format(complete_daily$date, "%m-%d") %in% c("12-30", "12-31", "01-01", "01-02", "01-03")
+knitr::kable(label_days(complete_daily[boundary, c("date", "sales")]), row.names = FALSE)
+# Separate holiday-date summaries by locale; dates may occur in multiple groups.
+for (loc in unique(h$locale)) {
+  hd <- unique(h$date[h$locale == loc & !is.na(h$transferred) & tolower(as.character(h$transferred)) == "false"])
+  z <- complete_daily$sales[complete_daily$date %in% hd]
+  cat(loc, "non-transferred event dates: n =", length(z), "; mean sales =", mean(z), "\n")
+}
+```
+
+```{r report-holiday-extremes, results='asis'}
+report_extreme_dates <- unique(c(head(drops$date, 5), complete_daily$date[head(order(-complete_daily$sales), 3)]))
+report_events <- daily_sales[match(report_extreme_dates, daily_sales$date), c("date", "sales", "percent_change")]
+report_events <- label_days(report_events)
+report_events$holiday_records <- ifelse(is.na(report_events$holiday_records), "-",
+  paste0(substr(report_events$holiday_records, 1, 58), ifelse(nchar(report_events$holiday_records) > 58, "...", "")))
+report_table(report_events, "Largest sales drops and high-sales dates", digits = 1,
+ col.names = c("Date", "Sales", "Change (%)", "Event context", "Weekday"), alignment = "llrp{6.2cm}l")
+report_years <- sort(unique(format(complete_daily$date, "%Y")))
+report_boundaries <- do.call(rbind, lapply(report_years, function(y) {
+  jan <- match(as.Date(paste0(y, "-01-01")), daily_sales$date)
+  dec <- match(as.Date(paste0(as.integer(y) - 1L, "-12-31")), daily_sales$date)
+  data.frame(Year = y, `Previous Dec 31` = daily_sales$sales[dec], `Jan 1` = daily_sales$sales[jan],
+    `Jan 1 change (%)` = daily_sales$percent_change[jan], check.names = FALSE)
+}))
+report_table(report_boundaries, "Year-boundary sales", digits = 1)
+cat(sprintf("Daily totals outside the 1.5-IQR fences: %d; **none were removed**. Event descriptions are abbreviated for display.\n\n", sum(flag)))
+```
+
+Holiday matches contextualize unusually low/high sales without establishing
+causation or confirming errors. Transferred source dates and actual observances
+are distinguished in forecasting, and local/regional holidays apply only to
+relevant stores. Strong year-boundary drops are retained as genuine observations.
+
+```{r promotions-and-sales, echo=FALSE, results='hide', fig.height=4.1}
+promo_ok <- complete.cases(daily_sales[c("sales", "promotion")])
+cat("Days omitted from sales/promotion comparison:", sum(!promo_ok), "\n")
+promo <- daily_sales[promo_ok, ]
+par(mfrow = c(1, 2))
+plot(promo$promotion, promo$sales, pch = 16, cex = .45, col = "#33669966",
+  main = "Sales versus Promotion Activity", xlab = "Sum of onpromotion counts", ylab = "Daily sales")
+plot(daily_sales$date, daily_sales$promotion, type = "l", main = "Daily Promotion Activity",
+  xlab = "Date", ylab = "Sum of onpromotion counts")
+par(mfrow = c(1, 1))
+cat("Descriptive Pearson correlation:", cor(promo$sales, promo$promotion), "\n")
+```
+
+```{r report-promotion-note, results='asis'}
+cat(sprintf("The descriptive sales-promotion correlation is %.3f, using %d complete days (%d omitted). Promotion counts describe activity, not discounts. Their association is confounded by trend, calendar effects and targeting; it is not a causal estimate.\n\n",
+ cor(promo$sales, promo$promotion), nrow(promo), sum(!promo_ok)))
+```
+
+# 3. Trend, weekly seasonality and dependence
+
+For the regular aggregate segment, $z_t=\log(1+y_t)$ is decomposed as
+$z_t=T_t+S_t+R_t$ using robust weekly STL (frequency 7; seasonal window 13).
+Robust smoothing downweights unusual observations but does not delete them.
+
+```{r aggregate-stl, echo=FALSE, results='hide', fig.keep=1, fig.height=6.2}
+y <- ts(segment$value, frequency = 7)
+z <- log1p(y)
+fit_stl <- stl(z, s.window = 13, robust = TRUE)
+plot(fit_stl, main = "Weekly STL of log(1 + Daily Total Sales)")
+sa <- z - fit_stl$time.series[, "seasonal"]
+trend <- fit_stl$time.series[, "trend"]
+seasonal <- fit_stl$time.series[, "seasonal"]
+cat("Smoothed trend: first 28-day mean =", mean(head(trend, 28)),
+    "; last 28-day mean =", mean(tail(trend, 28)), "\n")
+block <- cut(seq_along(seasonal), breaks = 4, labels = FALSE)
+seasonal_profiles <- sapply(1:4, function(b) tapply(seasonal[block == b], cycle(z)[block == b], mean))
+matplot(1:7, seasonal_profiles, type = "b", pch = 1:4, lty = 1,
+  xlab = "Weekly phase (phase 1 = segment start weekday)", ylab = "Log-scale seasonal effect",
+  main = "Weekly Seasonal Profiles across Four Time Blocks")
+legend("topright", legend = paste("Block", 1:4), col = 1:4, pch = 1:4, lty = 1, bty = "n")
+cat("Range of block seasonal amplitudes:", range(apply(seasonal_profiles, 2, function(x) diff(range(x)))), "\n")
+```
+
+```{r report-stl-note, results='asis'}
+cat(sprintf("The last minus first 28-day mean trend is %.3f log units. Across four time blocks, weekly seasonal amplitudes range from %.3f to %.3f. ",
+ mean(tail(trend, 28)) - mean(head(trend, 28)),
+ min(apply(seasonal_profiles, 2, function(x) diff(range(x)))),
+ max(apply(seasonal_profiles, 2, function(x) diff(range(x))))))
+cat("STL shows evolving trend/weekly structure, but does not distinguish deterministic from stochastic trends. Its fitted components are exploratory and are not reused as fixed forecasting regressors.\n\n")
+```
+
+```{r dependence-helpers, include=FALSE}
+plot_dependence <- function(x, label, lag_max = 56) {
+  lag_max <- min(lag_max, floor(length(x) / 4))
+  # Numeric input expresses lags in days instead of multiples of frequency 7.
+  par(mfrow = c(1, 2))
+  acf(as.numeric(x), lag.max = lag_max, main = paste(label, "ACF"), xlab = "Lag (days)")
+  pacf(as.numeric(x), lag.max = lag_max, main = paste(label, "PACF"), xlab = "Lag (days)")
+  par(mfrow = c(1, 1))
+}
+weekly_acf <- function(x) {
+  a <- acf(as.numeric(x), lag.max = 28, plot = FALSE)$acf
+  data.frame(lag_days = c(7, 14, 21, 28), acf = as.numeric(a[c(7, 14, 21, 28) + 1]),
+             approximate_bound = 1.96 / sqrt(length(x)))
+}
+```
+```{r aggregate-acf-pacf, echo=FALSE, results='hide', fig.height=3.9}
+plot_dependence(y, "Original aggregate")
+knitr::kable(weekly_acf(y), digits = 4)
+plot_dependence(sa, "STL-adjusted log sales")
+knitr::kable(weekly_acf(sa), digits = 4)
+```
+
+```{r report-weekly-dependence, results='asis'}
+report_table(data.frame(`Lag (days)` = c(7,14,21,28), Raw = weekly_acf(y)$acf,
+  `Adjusted log` = weekly_acf(sa)$acf, check.names = FALSE), "Weekly-lag autocorrelations", digits = 3)
+```
+
+Slow ACF decay is compatible with persistent dependence and changing levels;
+weekly-lag correlations complement the weekday plots. The plotted bounds are
+pointwise white-noise approximations, not multiplicity-adjusted seasonal tests.
+STL adjustment is estimated and itself changes the dependence structure.
+
+# 4. Stationarity and series heterogeneity
+
+ADF tests $H_0$: a unit root. KPSS tests $H_0$: stationarity around the stated
+deterministic terms. Raw/log levels include an intercept and trend; differences
+use a constant. ADF lag selection allows at least four weeks, and both short and
+long KPSS bandwidths are retained to expose sensitivity.
+
+With deterministic terms included, the ADF regression has the form
+\[
+\Delta z_t=\alpha+\beta t+\gamma z_{t-1}
+ +\sum_{j=1}^{p}\psi_j\Delta z_{t-j}+u_t,\qquad H_0:\gamma=0.
+\]
+The trend term is omitted for the constant-only specification. KPSS instead
+tests whether fluctuations around those deterministic terms are stationary;
+its long-run variance estimate depends on bandwidth. Short/long decisions
+are therefore reported together rather than as repeated independent evidence.
+
+```{r stationarity-test-helpers, include=FALSE}
+run_tests <- function(x, label, trend = TRUE) {
+  x <- as.numeric(x)
+  stopifnot(!anyNA(x))
+  # At least four weeks available for lag selection; Schwert sample-size rule.
+  max_lag <- min(max(28L, floor(12 * (length(x) / 100)^.25)), floor(length(x) / 5))
+  adf <- urca::ur.df(x, type = if (trend) "trend" else "drift",
+                     lags = max_lag, selectlags = "AIC")
+  tau <- if (trend) "tau3" else "tau2"
+  astat <- as.numeric(adf@teststat[1, tau])
+  acrit <- as.numeric(adf@cval[tau, "5pct"])
+  # Report both conventional short and long KPSS bandwidth choices.
+  rows <- lapply(c("short", "long"), function(bw) {
+    kpss <- urca::ur.kpss(x, type = if (trend) "tau" else "mu", lags = bw)
+    kstat <- as.numeric(kpss@teststat)
+    kcrit <- as.numeric(kpss@cval[1, "5pct"])
+    data.frame(series = label, deterministic = if (trend) "intercept + trend" else "intercept",
+      n = length(x), ADF_max_lag = max_lag, ADF_lag = sum(grepl("z.diff.lag", rownames(adf@testreg$coefficients), fixed = TRUE)), ADF_stat = astat, ADF_critical_5pct = acrit,
+      ADF_reject = astat < acrit, KPSS_bandwidth = bw, KPSS_lag = kpss@lag,
+      KPSS_stat = kstat, KPSS_critical_5pct = kcrit, KPSS_reject = kstat > kcrit)
+  })
+  do.call(rbind, rows)
+}
+interpret_tests <- function(tab) {
+  for (i in seq_len(nrow(tab))) {
+    r <- tab[i, ]
+    cat(r$series, "(", r$KPSS_bandwidth, "KPSS bandwidth): ADF",
+        if (r$ADF_reject) "rejects the unit-root null" else "does not reject the unit-root null",
+        "; KPSS", if (r$KPSS_reject) "rejects its stationarity null." else "does not reject its stationarity null.", "\n")
+  }
+}
+```
+```{r aggregate-stationarity-tests, include=FALSE}
+aggregate_tests <- rbind(run_tests(y, "Raw total", TRUE),
+                         run_tests(z, "Log total", TRUE),
+                         run_tests(sa, "Seasonally adjusted log total", TRUE))
+knitr::kable(aggregate_tests, digits = 4, row.names = FALSE)
+interpret_tests(aggregate_tests)
+```
+```{r first-difference-diagnostics, include=FALSE}
+# A diagnostic comparison, not an automatic decision to difference.
+dsa <- diff(sa)
+plot(segment$date[-1], as.numeric(dsa), type = "l", main = "First Difference of Seasonally Adjusted Log Sales",
+     xlab = "Date", ylab = "Change in adjusted log sales")
+plot_dependence(dsa, "Differenced adjusted log sales")
+difference_tests <- run_tests(dsa, "Differenced adjusted log total", FALSE)
+knitr::kable(difference_tests, digits = 4, row.names = FALSE)
+interpret_tests(difference_tests)
+```
+
+```{r report-stationarity, results='asis'}
+report_stationarity(rbind(aggregate_tests, difference_tests), "Aggregate stationarity results")
+```
+
+Rejecting ADF is evidence against a unit root; non-rejection is not proof of one.
+Disagreement with KPSS leaves uncertainty rather than proving stationarity.
+A deterministic-trend interpretation has mean-reverting shocks around a fixed
+trend; a stochastic trend permits persistent level shocks. First differences are
+a diagnostic alternative, not an automatic response to an increasing plot.
+Over-differencing can introduce negative short-lag correlation. Weekly
+seasonality alone does not require seasonal differencing.
+
+```{r report-differenced-plots, fig.height=3.9}
+plot(segment$date[-1], as.numeric(dsa), type = "l", main = "Differenced adjusted log sales",
+ xlab = "Date", ylab = "Change in adjusted log sales")
+plot_dependence(dsa, "Differenced adjusted log sales")
+```
+
+## Representative store-family series
+
+```{r representative-series-selection, include=FALSE}
+cat("Stores:", length(unique(t$store_nbr)), "; families:", length(unique(t$family)),
+    "; observed store–family combinations:", nrow(pairs), "\n")
+series_key <- paste(t$store_nbr, t$family, sep = " | ")
+series_rows <- split(seq_len(nrow(t)), series_key)
+series_summary <- do.call(rbind, lapply(names(series_rows), function(key) {
+  x <- t[series_rows[[key]], ]
+  data.frame(key = key, store_nbr = x$store_nbr[1], family = x$family[1],
+    rows = nrow(x), missing_sales = sum(is.na(x$sales)),
+    mean = if (all(is.na(x$sales))) NA_real_ else mean(x$sales, na.rm = TRUE),
+    zero_fraction = if (all(is.na(x$sales))) NA_real_ else mean(x$sales == 0, na.rm = TRUE),
+    missing_calendar_dates = length(seq(min(x$date), max(x$date), by = "day")) - length(unique(x$date)))
+}))
+cat("Pairs with absent dates within their own span:", sum(series_summary$missing_calendar_dates > 0), "\n")
+knitr::kable(summary(series_summary[c("rows", "missing_sales", "missing_calendar_dates", "mean", "zero_fraction")]))
+candidates <- series_summary[is.finite(series_summary$mean) & series_summary$mean > 0, ]
+candidates <- candidates[order(candidates$mean, candidates$key), ]
+chosen <- candidates[unique(pmax(1, round(c(.2, .5, .9) * nrow(candidates)))), ]
+knitr::kable(chosen, digits = 3, row.names = FALSE)
+```
+```{r individual-series-diagnostics, include=FALSE}
+report_individual_details <- list()
+individual_tests <- list()
+individual_features <- list()
+for (j in seq_len(nrow(chosen))) {
+  key <- chosen$key[j]
+  x <- t[series_rows[[key]], c("date", "sales")]
+  x <- merge(calendar, x, by = "date", all.x = TRUE, sort = TRUE)
+  s <- longest_segment(x$date, x$sales)
+  cat("\nSeries:", key, "; absent or missing sales dates:", sum(is.na(x$sales)),
+      "; contiguous segment:", as.character(min(s$date)), "to", as.character(max(s$date)),
+      "; n =", length(s$value), "; dates outside segment:", s$omitted, "\n")
+  plot(x$date, x$sales, type = "l", main = paste("Sales:", key), xlab = "Date", ylab = "Sales (units)")
+  if (length(s$value) < 60 || var(s$value) == 0) {
+    cat("Insufficient length or variation for these diagnostics.\n")
+    next
+  }
+  stopifnot(all(s$value >= 0))
+  zi <- ts(log1p(s$value), frequency = 7)
+  fi <- stl(zi, s.window = 13, robust = TRUE)
+  plot(fi, main = paste("Weekly Log-Sales STL:", key))
+  sai <- zi - fi$time.series[, "seasonal"]
+  report_individual_details[[key]] <- list(x = x, s = s, zi = zi, fi = fi, sai = sai)
+  plot_dependence(zi, paste(key, "log sales"))
+  plot_dependence(sai, paste(key, "adjusted"))
+  ti <- rbind(run_tests(zi, paste(key, "log"), TRUE),
+              run_tests(sai, paste(key, "adjusted"), TRUE))
+  print(knitr::kable(ti, digits = 4, row.names = FALSE))
+  interpret_tests(ti)
+  individual_tests[[key]] <- ti
+  remainder <- fi$time.series[, "remainder"]
+  individual_features[[key]] <- data.frame(series = key, n = length(zi),
+    zero_fraction = mean(s$value == 0),
+    trend_endpoint_change = mean(tail(fi$time.series[, "trend"], 28)) - mean(head(fi$time.series[, "trend"], 28)),
+    seasonal_strength = max(0, 1 - var(remainder) / var(remainder + fi$time.series[, "seasonal"])),
+    log_ACF7 = weekly_acf(zi)$acf[1], adjusted_ACF7 = weekly_acf(sai)$acf[1])
+}
+features <- do.call(rbind, individual_features)
+knitr::kable(features, digits = 4, row.names = FALSE)
+```
+
+```{r report-individual-sales, fig.height=3.1}
+report_example <- report_individual_details[[chosen$key[1]]]
+plot(report_example$x$date, report_example$x$sales, type = "l",
+ main = paste("Sales:", chosen$key[1]), xlab = "Date", ylab = "Sales (units)")
+```
+
+```{r report-individual-stl, fig.height=4.7}
+plot(report_example$fi, main = paste("Weekly log-sales STL:", chosen$key[1]))
+```
+
+```{r report-individual-dependence, fig.height=3.6}
+plot_dependence(report_example$zi, "Log sales")
+plot_dependence(report_example$sai, "Adjusted log sales")
+```
+
+```{r report-individual-comparison, results='asis'}
+report_individual <- features[c("series", "zero_fraction", "trend_endpoint_change", "seasonal_strength")]
+for (kind in c("log", "adjusted")) {
+  report_individual[[paste("ADF", kind)]] <- vapply(report_individual$series, function(k) {
+    z <- individual_tests[[k]]; idx <- if (kind == "log") 1:2 else 3:4
+    report_decision(z$ADF_reject[idx[1]])
+  }, "")
+  report_individual[[paste("KPSS", kind)]] <- vapply(report_individual$series, function(k) {
+    z <- individual_tests[[k]]; idx <- if (kind == "log") 1:2 else 3:4
+    paste(report_decision(z$KPSS_reject[idx]), collapse = "/")
+  }, "")
+}
+report_individual$zero_fraction <- 100 * report_individual$zero_fraction
+report_individual_compact <- data.frame(Series = report_individual$series, Zeros = report_individual$zero_fraction,
+ Trend = report_individual$trend_endpoint_change, Strength = report_individual$seasonal_strength,
+ ADF = paste(report_individual[["ADF log"]], report_individual[["ADF adjusted"]], sep = "/"),
+ KPSS = paste(report_individual[["KPSS log"]], report_individual[["KPSS adjusted"]], sep = "; "))
+report_table(report_individual_compact, "Three-series EDA-segment comparison", digits = 3,
+ col.names = c("Series", "Zero %", "Trend", "Strength", "ADF log/adj", "KPSS log; adj"), alignment = "p{3.8cm}rrrrl")
+cat("ADF gives log/adjusted decisions; each KPSS pair gives short/long bandwidth decisions, first log then adjusted. R = reject; NR = do not reject.\n\n")
+report_stationarity(individual_tests[[chosen$key[1]]], "Detailed-series stationarity results")
+```
+
+The detailed plots show one example; all three are analyzed in the source.
+Trend change is the endpoint difference in 28-day mean STL trend on log scale.
+All comparison metrics refer to their complete EDA segments. Seasonal strength is
+$F_S=\max\{0,1-\operatorname{Var}(R_t)/\operatorname{Var}(S_t+R_t)\}$,
+a descriptive variance ratio rather than a hypothesis test.
+Variation in these measures, zeros and stationarity decisions demonstrates why
+aggregate findings cannot be imposed on every store-family series. All regular
+EDA diagnostics use their complete contiguous segment; final model fitting uses
+the full history, not just the 365-observation exploratory segment.
+
+```{r computed-summary, include=FALSE}
+cat(sprintf("- **Data quality:** %s missing training sales values; %s actual zero sales records retained. %s training calendar dates are absent. %s daily totals are unavailable or incomplete.\n",
+  sum(is.na(train$sales)), sum(train$sales == 0, na.rm = TRUE), length(missing_dates$train), sum(is.na(daily_sales$sales))))
+cat(sprintf("- **Trend:** on the complete analysis segment, the final minus initial 28-day mean STL trend is %.3f log units. This describes a smoothed change, not a deterministic-trend test.\n",
+            mean(tail(trend, 28)) - mean(head(trend, 28))))
+cat(sprintf("- **Weekly dependence:** raw total ACF at 7/14/21/28 days is %s; adjusted log ACF is %s. These are interpreted alongside weekday boxplots and STL profiles.\n",
+  paste(round(weekly_acf(y)$acf, 3), collapse = ", "), paste(round(weekly_acf(sa)$acf, 3), collapse = ", ")))
+for (label in unique(aggregate_tests$series)) {
+  r <- aggregate_tests[aggregate_tests$series == label, ]
+  cat(sprintf("- **%s tests:** trend ADF %s at 5%%; trend KPSS rejects with %s of two bandwidth choices.\n", label,
+    if (r$ADF_reject[1]) "rejects a unit root" else "does not reject a unit root", sum(r$KPSS_reject)))
+}
+cat(sprintf("- **Differencing:** adjusted-log first-difference ADF %s; KPSS rejects with %s of two bandwidth choices. Differencing remains a candidate diagnostic, not a settled model choice.\n",
+  if (difference_tests$ADF_reject[1]) "rejects a unit root" else "does not reject a unit root", sum(difference_tests$KPSS_reject)))
+cat(sprintf("- **Heterogeneity:** the selected store–family weekly seasonal strengths range from %.3f to %.3f; their zero fractions range from %.3f to %.3f. Assess models individually.\n",
+  min(features$seasonal_strength), max(features$seasonal_strength), min(features$zero_fraction), max(features$zero_fraction)))
+```
+```{r segment-representativeness, include=FALSE}
+in_segment <- daily_sales$date %in% segment$date
+segment_comparison <- rbind(
+  retained = describe(daily_sales$sales[in_segment]),
+  outside_segment = describe(daily_sales$sales[!in_segment]))
+knitr::kable(segment_comparison, digits = 3)
+cat("Observed daily totals discarded by segment selection:",
+    sum(!is.na(daily_sales$sales[!in_segment])), "\n")
+knitr::kable(table(year = format(daily_sales$date, "%Y"), retained = in_segment))
+```
+
+# 5. Forecasting features
+
+Write $Z_t=\log(1+Y_t)$. The regression features are linear time trend, weekday
+indicators, $\log(1+\mathrm{onpromotion})$, localized holiday/compensating-workday
+flags, payday indicators for the 15th/month end, and annual Fourier terms
+\[
+S_t=\sum_{k=1}^{K}\{a_k\sin(2\pi kt/365.25)+b_k\cos(2\pi kt/365.25)\},
+\qquad K\in\{1,2,3\}.
+\]
+Month ends include February/leap years. National events apply to all stores;
+regional/local events match state/city. Transferred source holidays are excluded
+and destination observances included. Binary event flags avoid duplicate joins.
+Unplanned events and unknown future transactions/oil prices are excluded. Store
+attributes are constant within a series and would duplicate its intercept.
+
+Full-history OLS BIC/AICc screens $K=1,2,3$. Their IID-error criteria are only
+screening proxies. The final comparison uses joint exact likelihood, comparing
+$K=1$ with the better higher-order screen at the winning error order. QR checks
+remove constants/aliases, including after differencing. Training and future
+matrices have identical columns and categorical encodings.
+
+```{r modeling-configuration, include=FALSE}
+# All model definitions are embedded below: no external R script required.
+# Classical store-family forecasting. No packages are attached to the search path.
+if (!requireNamespace("forecast", quietly = TRUE)) stop("Install package 'forecast'.")
+row_key <- function(x) paste(x$date, x$store_nbr, x$family, sep = "|")
+pair_key <- function(x) paste(x$store_nbr, x$family, sep = " | ")
+
+make_holiday_calendar <- function(stores, events, dates) {
+  stopifnot(!anyDuplicated(stores$store_nbr))
+  out <- expand.grid(date = dates, store_nbr = stores$store_nbr)
+  out$date <- as.Date(out$date, origin = "1970-01-01")
+  out$holiday <- 0L; out$workday <- 0L
+  # Source dates marked transferred are not observances; Transfer rows supply
+  # destination dates. Additional/Bridge days count as observances, Work Day
+  # compensating dates get a separate flag. Event rows are not called holidays.
+  eligible <- !is.na(events$transferred) &
+    tolower(as.character(events$transferred)) == "false"
+  e <- events[eligible & events$type %in%
+    c("Holiday", "Transfer", "Additional", "Bridge", "Work Day"), ]
+  for (i in seq_len(nrow(e))) {
+    st <- switch(e$locale[i], National = stores$store_nbr,
+      Regional = stores$store_nbr[stores$state == e$locale_name[i]],
+      Local = stores$store_nbr[stores$city == e$locale_name[i]], integer())
+    ix <- out$date == e$date[i] & out$store_nbr %in% st
+    field <- if (e$type[i] == "Work Day") "workday" else "holiday"
+    out[[field]][ix] <- 1L
+  }
+  stopifnot(!anyDuplicated(paste(out$date, out$store_nbr)))
+  out
+}
+
+make_features <- function(date, promotion, holiday, workday) {
+  time <- as.numeric(date - as.Date("2013-01-01"))
+  x <- data.frame(trend = time / 365.25,
+    weekday = factor((as.integer(date) + 3L) %% 7L + 1L, levels = 1:7),
+    promo = log1p(promotion), holiday = holiday, workday = workday,
+    payday15 = as.integer(format(date, "%d") == "15"),
+    payday_end = as.integer(format(date + 1L, "%m") != format(date, "%m")))
+  for (k in 1:3) {
+    suffix <- if (k == 1L) "" else as.character(k)
+    x[[paste0("annual_sin", suffix)]] <- sin(2 * pi * k * time / 365.25)
+    x[[paste0("annual_cos", suffix)]] <- cos(2 * pi * k * time / 365.25)
+  }
+  x
+}
+
+prepare_series <- function(history, future, holiday_calendar) {
+  stopifnot(length(unique(history$store_nbr)) == 1L,
+    length(unique(history$family)) == 1L, !anyDuplicated(history$date),
+    !anyDuplicated(future$date), all(history$date < min(future$date)))
+  a <- data.frame(date = seq(as.Date("2013-01-01"), min(future$date) - 1L, by = "day"))
+  ix <- match(a$date, history$date)
+  a$sales <- history$sales[ix]; a$onpromotion <- history$onpromotion[ix]
+  b <- future[order(future$date), , drop = FALSE]
+  stopifnot(all(diff(as.numeric(a$date)) == 1), all(diff(as.numeric(b$date)) == 1),
+            min(b$date) == max(a$date) + 1)
+  sid <- as.character(history$store_nbr[1])
+  hd <- if (is.data.frame(holiday_calendar)) {
+    list(data = holiday_calendar[holiday_calendar$store_nbr == as.integer(sid), ], features = NULL)
+  } else holiday_calendar[[sid]]
+  ia <- match(a$date, hd$data$date); ib <- match(b$date, hd$data$date)
+  stopifnot(!anyNA(ia), !anyNA(ib))
+  med <- median(a$onpromotion, na.rm = TRUE)
+  if (!is.finite(med)) med <- 0
+  npa <- sum(is.na(a$onpromotion)); npb <- sum(is.na(b$onpromotion))
+  # Impute covariates only, using this series' training median. Never fill sales.
+  a$onpromotion[is.na(a$onpromotion)] <- med
+  b$onpromotion[is.na(b$onpromotion)] <- med
+  if (is.null(hd$features)) {
+    xa <- make_features(a$date, a$onpromotion, hd$data$holiday[ia], hd$data$workday[ia])
+    xb <- make_features(b$date, b$onpromotion, hd$data$holiday[ib], hd$data$workday[ib])
+  } else {
+    xa <- hd$features[ia, , drop = FALSE]; xb <- hd$features[ib, , drop = FALSE]
+    xa$promo <- log1p(a$onpromotion); xb$promo <- log1p(b$onpromotion)
+  }
+  stopifnot(!anyNA(xa), !anyNA(xb), all(a$sales[!is.na(a$sales)] >= 0))
+  list(history = a, future = b, xa = xa, xb = xb,
+    missing_sales = sum(is.na(a$sales)), absent_dates = sum(is.na(ix)),
+    missing_promo_train = npa, missing_promo_future = npb)
+}
+
+xreg_pair <- function(prep, extended = TRUE, integrated = FALSE, seasonal_difference = FALSE, K = 1L) {
+  stopifnot(K %in% 1:3)
+  suffix <- c("", if (K >= 2L) as.character(2:K))
+  annual <- as.vector(rbind(paste0("annual_sin", suffix), paste0("annual_cos", suffix)))
+  terms <- c(if (!integrated) "trend", if (!seasonal_difference) "weekday", "promo",
+             "payday15", "payday_end", if (extended) c("holiday", "workday", annual))
+  f <- reformulate(terms)
+  a <- model.matrix(f, prep$xa); b <- model.matrix(f, prep$xb)
+  stopifnot(identical(colnames(a), colnames(b)))
+  # Remove constants and then aliases relative to the model intercept, using
+  # training observations only. Intercept is fitted by lm/Arima, not duplicated.
+  observed <- !is.na(prep$history$sales)
+  keep <- colnames(a) != "(Intercept)" & apply(a[observed, , drop = FALSE], 2, function(x) diff(range(x)) > 1e-10)
+  a <- a[, keep, drop = FALSE]; b <- b[, keep, drop = FALSE]
+  augmented <- cbind(intercept = 1, a[observed, , drop = FALSE])
+  q <- qr(augmented)
+  good <- sort(q$pivot[seq_len(q$rank)])
+  cols <- setdiff(colnames(augmented)[good], "intercept")
+  dropped <- setdiff(colnames(a), cols)
+  a <- a[, cols, drop = FALSE]; b <- b[, cols, drop = FALSE]
+  stopifnot(identical(colnames(a), colnames(b)), !anyNA(a), !anyNA(b),
+    qr(cbind(1, a[observed, , drop = FALSE]))$rank == ncol(a) + 1)
+  list(train = a, future = b, dropped = dropped)
+}
+
+seasonal_naive <- function(prep) {
+  a <- prep$history; b <- prep$future
+  weekday <- (as.integer(a$date) + 3L) %% 7L + 1L
+  observed <- a$sales[!is.na(a$sales)]
+  last <- if (length(observed)) tail(observed, 1L) else 0
+  by_weekday <- rep(last, 7L)
+  for (day in 1:7) {
+    values <- a$sales[!is.na(a$sales) & weekday == day]
+    if (length(values)) by_weekday[day] <- tail(values, 1L)
+  }
+  unname(by_weekday[(as.integer(b$date) + 3L) %% 7L + 1L])
+}
+
+regular_tail <- function(x) {
+  r <- rle(!is.na(x)); ends <- cumsum(r$lengths)
+  j <- which(r$values)
+  if (!length(j)) return(numeric())
+  k <- tail(j, 1)
+  x[seq.int(ends[k] - r$lengths[k] + 1L, ends[k])]
+}
+
+identify_differences <- function(z, adjusted = NULL) {
+  # Only diagnostics use contiguous segments; all joint ML fits retain all dates.
+  if (is.null(adjusted)) {
+    tt <- seq_along(z); dow <- factor((tt - 1L) %% 7L, levels = 0:6)
+    xx <- model.matrix(~ tt + dow); ok <- !is.na(z)
+    adjusted <- rep(NA_real_, length(z))
+    if (sum(ok) > ncol(xx)) adjusted[ok] <- lm.fit(xx[ok, , drop = FALSE], z[ok])$residuals
+  }
+  s <- regular_tail(z); r <- regular_tail(adjusted); issues <- character()
+  defaults <- list(d = 0L, D = 0L, n = min(length(s), length(r)), seas = NA, ocsb = NA,
+    raw_level_kpss = NA, raw_trend_kpss = NA, raw_trend_adf = NA, adjusted_kpss = NA,
+    raw_acf7 = NA_real_, adjusted_acf7 = NA_real_, difference_acf1 = NA_real_,
+    weekly_difference_acf7 = NA_real_, issue = "",
+    justification = "Insufficient regular diagnostic segment/variation: conservative d=D=0")
+  if (length(s) < 80L || length(r) != length(s) || var(r) < 1e-12) return(defaults)
+  safe <- function(expr, label) tryCatch(withCallingHandlers(expr,
+    warning = function(w) {
+      issues <<- c(issues, paste(label, conditionMessage(w))); invokeRestart("muffleWarning")
+    }), error = function(e) {
+      issues <<- c(issues, paste(label, conditionMessage(e), "support defaulted to 0")); 0L
+    })
+  s <- ts(s, frequency = 7); r <- ts(r, frequency = 7)
+  get_acf <- function(x, lag) as.numeric(acf(as.numeric(x), lag.max = lag, plot = FALSE)$acf[lag + 1L])
+  seas <- safe(forecast::nsdiffs(r, test = "seas", max.D = 1), "Adjusted seasonal strength:")
+  ocsb <- safe(forecast::nsdiffs(r, test = "ocsb", max.D = 1), "Adjusted OCSB:")
+  ac7 <- get_acf(r, 7L)
+  D <- as.integer(seas == 1L && ocsb == 1L && ac7 > 1.96 / sqrt(length(r)))
+  w <- if (D) diff(s, lag = 7) else s
+  v <- if (D) diff(r, lag = 7) else r
+  raw_level <- safe(forecast::ndiffs(w, test = "kpss", type = "level", max.d = 1), "Raw level KPSS:")
+  type <- if (D) "level" else "trend"
+  raw_trend <- safe(forecast::ndiffs(w, test = "kpss", type = type, max.d = 1), "Raw deterministic-specification KPSS:")
+  raw_adf <- safe(forecast::ndiffs(w, test = "adf", type = type, max.d = 1), "Raw deterministic-specification ADF:")
+  adjusted_kpss <- safe(forecast::ndiffs(v, test = "kpss", type = "level", max.d = 1), "Adjusted-component KPSS screen:")
+  # Conservative evidence agreement, not proof. ADF inference is on the raw
+  # series with explicit deterministic terms, never on fitted OLS residuals.
+  d <- as.integer(raw_trend == 1L && raw_adf == 1L && adjusted_kpss == 1L)
+  reason <- if (d) "Raw deterministic-specification ADF/KPSS and adjusted-component screen support d=1" else
+    "Evidence does not jointly require d=1; retain deterministic trend with stationary errors"
+  if (raw_trend != raw_adf) issues <- c(issues, "ADF/KPSS support disagrees; no definitive unit-root conclusion")
+  if (D) reason <- paste(reason, "; D=1 supported after removing deterministic calendar effects") else
+    reason <- paste(reason, "; deterministic weekday effects retained, D=0")
+  list(d = d, D = D, n = length(s), seas = seas, ocsb = ocsb,
+    raw_level_kpss = raw_level, raw_trend_kpss = raw_trend, raw_trend_adf = raw_adf,
+    adjusted_kpss = adjusted_kpss, raw_acf7 = get_acf(s, 7L), adjusted_acf7 = ac7,
+    difference_acf1 = get_acf(diff(w), 1L), weekly_difference_acf7 = get_acf(diff(r, lag = 7), 7L),
+    issue = paste(unique(issues), collapse = "; "), justification = reason)
+}
+
+root_check <- function(fit) {
+  roots <- function(v, sign) {
+    if (!length(v) || all(abs(v) < 1e-12)) return(Inf)
+    min(Mod(polyroot(c(1, sign * v))))
+  }
+  c(AR_root = roots(fit$model$phi, -1), MA_root = roots(fit$model$theta, 1))
+}
+
+screen_fourier <- function(prep, z) {
+  ok <- !is.na(z); n <- sum(ok)
+  rows <- list(); residuals <- list()
+  for (K in 1:3) {
+    xr <- xreg_pair(prep, extended = TRUE, K = K)
+    f <- lm.fit(cbind(intercept = 1, xr$train[ok, , drop = FALSE]), z[ok])
+    k <- f$rank + 1L  # regression coefficients plus innovation variance
+    rss <- max(sum(f$residuals^2), .Machine$double.eps)
+    rows[[K]] <- data.frame(K = K, n = n, parameters = k,
+      iid_AICc_screen = n * log(rss / n) + 2 * k + 2 * k * (k + 1) / (n - k - 1),
+      iid_BIC_screen = n * log(rss / n) + log(n) * k)
+    e <- rep(NA_real_, length(z)); e[ok] <- f$residuals; residuals[[K]] <- e
+  }
+  tab <- do.call(rbind, rows)
+  seed <- tab$K[which.min(tab$iid_BIC_screen)]
+  higher <- tab$K[tab$K > 1L][which.min(tab$iid_BIC_screen[tab$K > 1L])]
+  # Always compare the parsimonious K=1 with the better higher-order screen.
+  shortlist <- unique(c(seed, 1L, higher))
+  tab$shortlisted <- tab$K %in% shortlist
+  list(table = tab, seed = seed, shortlist = shortlist, residual = residuals[[seed]])
+}
+
+screen_orders <- function(z, d, D, adjusted = NULL) {
+  r <- regular_tail(if (is.null(adjusted)) z else adjusted)
+  issues <- character(); pilot <- NULL
+  if (length(r) >= 80L && is.finite(var(r)) && var(r) > 1e-12) {
+    pilot <- tryCatch(withCallingHandlers(
+      forecast::auto.arima(ts(r, frequency = 7), d = d, D = D,
+        max.p = 2, max.q = 2, max.P = 1, max.Q = 1,
+        start.p = 1, start.q = 1, start.P = 0, start.Q = 0,
+        stepwise = TRUE, nmodels = 18, approximation = TRUE,
+        allowmean = FALSE, allowdrift = FALSE, parallel = FALSE),
+      warning = function(w) { issues <<- c(issues, conditionMessage(w)); invokeRestart("muffleWarning") }),
+      error = function(e) { issues <<- c(issues, conditionMessage(e)); NULL })
+  }
+  if (!is.null(pilot) && isTRUE(pilot$code == 0)) {
+    first <- as.integer(pilot$arma[1:4])  # compact p,q,P,Q always includes zero seasonal orders
+  } else first <- c(0L, 1L, 0L, 1L)
+  reference <- c(0L, 1L, 0L, 1L)
+  lag_values <- function(x, partial = FALSE) {
+    a <- if (partial) pacf(x, lag.max = 2, plot = FALSE)$acf else acf(x, lag.max = 2, plot = FALSE)$acf[-1]
+    as.numeric(a)
+  }
+  list(specs = list(first, c(1L, 0L, 1L, 0L), reference, c(1L, 1L, 0L, 1L)), pilot = pilot, n = length(r),
+    acf2 = if (length(r) > 10L && var(r) > 0) lag_values(r) else c(0, 0),
+    pacf2 = if (length(r) > 10L && var(r) > 0) lag_values(r, TRUE) else c(0, 0),
+    issue = paste(unique(issues), collapse = "; "))
+}
+
+fit_arima_candidates <- function(z, xreg = NULL, d = 0L, D = 0L,
+                                 specs = NULL, K = 1L, warm_fit = NULL) {
+  if (is.null(specs)) specs <- screen_orders(z, d, D)$specs
+  id <- vapply(specs, paste, collapse = ",", "")
+  specs <- specs[!duplicated(id)]
+  fits <- vector("list", length(specs)); rows <- vector("list", length(specs))
+  y <- ts(z, frequency = 7)
+  if (!is.null(xreg) && !ncol(xreg)) xreg <- NULL
+  mean_term <- d + D == 0L
+  drift_term <- is.null(xreg) && d == 1L && D == 0L
+  for (i in seq_along(specs)) {
+    s <- as.integer(specs[[i]])
+    stopifnot(length(s) == 4L, all(s >= 0L), all(s[1:2] <= 2L), all(s[3:4] <= 1L))
+    warnings <- character(); errors <- character(); attempts <- 0L; failed_calls <- 0L
+    start <- proc.time()[3]; initial <- NULL
+    prior <- if (i > 1L && !is.null(fits[[i - 1L]])) fits[[i - 1L]] else warm_fit
+    if (!is.null(prior) && isTRUE(prior$code == 0)) {
+      names_arma <- c(if (s[1]) paste0("ar", seq_len(s[1])), if (s[2]) paste0("ma", seq_len(s[2])),
+                      if (s[3]) paste0("sar", seq_len(s[3])), if (s[4]) paste0("sma", seq_len(s[4])))
+      v <- setNames(rep(0, length(names_arma)), names_arma)
+      common <- intersect(names_arma, names(coef(prior))); v[common] <- coef(prior)[common]
+      # NA regression starts are initialized in R's internal orthogonal basis.
+      initial <- c(unname(v), rep(NA_real_, if (is.null(xreg)) 0L else ncol(xreg)),
+                   if (mean_term || drift_term) NA_real_)
+    }
+    estimate <- function(init = NULL, maxit = 250L) {
+      attempts <<- attempts + 1L
+      f <- tryCatch(withCallingHandlers(
+        forecast::Arima(y, order = c(s[1], d, s[2]),
+          seasonal = list(order = c(s[3], D, s[4]), period = 7),
+          xreg = xreg, include.mean = mean_term, include.drift = drift_term,
+          method = "ML", init = init, optim.control = list(maxit = maxit)),
+        warning = function(w) { warnings <<- c(warnings, conditionMessage(w)); invokeRestart("muffleWarning") }),
+        error = function(e) { errors <<- c(errors, conditionMessage(e)); NULL })
+      if (is.null(f) || !isTRUE(f$code == 0)) failed_calls <<- failed_calls + 1L
+      f
+    }
+    f <- estimate(initial)
+    if ((!is.null(initial) && (is.null(f) || !isTRUE(f$code == 0))) ||
+        (!is.null(f) && isTRUE(f$code == 1))) f <- estimate(NULL, 500L)
+    roots <- tryCatch(if (!is.null(f)) root_check(f) else c(AR_root = NA_real_, MA_root = NA_real_),
+      error = function(e) { errors <<- c(errors, conditionMessage(e)); c(AR_root = NA_real_, MA_root = NA_real_) })
+    valid <- !is.null(f) && isTRUE(f$code == 0) && all(is.finite(coef(f))) &&
+      is.finite(f$sigma2) && f$sigma2 > 0 && is.finite(f$aicc) &&
+      all(is.finite(diag(f$var.coef))) && all(diag(f$var.coef) > 0) &&
+      all(!is.na(roots) & roots > 1 + 1e-6)
+    rows[[i]] <- data.frame(candidate = i, K = K,
+      p = s[1], q = s[2], P = s[3], Qseasonal = s[4],
+      order = sprintf("(%d,%d,%d)(%d,%d,%d)[7]", s[1], d, s[2], s[3], D, s[4]),
+      AICc = if (!is.null(f)) f$aicc else NA_real_, BIC = if (!is.null(f)) f$bic else NA_real_,
+      AR_root = roots[1], MA_root = roots[2], convergence = if (!is.null(f)) f$code else NA_integer_,
+      valid = valid, attempts = attempts, failed_calls = failed_calls,
+      seconds = unname(proc.time()[3] - start), warning = paste(unique(warnings), collapse = "; "),
+      error = paste(unique(errors), collapse = "; "), row.names = NULL)
+    fits[i] <- list(f)
+  }
+  tab <- do.call(rbind, rows); good <- which(tab$valid)
+  ranked <- good[order(tab$AICc[good], tab$K[good], good)]
+  list(fit = if (length(ranked)) fits[[ranked[1]]] else NULL,
+       fits = fits, table = tab, ranked = ranked)
+}
+
+innovation_diagnostics <- function(residual, fitdf = 0L) {
+  e <- regular_tail(as.numeric(residual))
+  # Do not remove internal NAs and collapse time. Diagnostic segment length reported.
+  if (length(e) < 40 || !is.finite(var(e)) || var(e) < 1e-12) return(data.frame())
+  out <- lapply(c(14L, 28L), function(h) {
+    h <- min(h, floor(length(e) / 5))
+    if (h <= fitdf) return(NULL)
+    b <- Box.test(e, lag = h, type = "Ljung-Box", fitdf = fitdf)
+    data.frame(n = length(e), mean = mean(e), lag = h, Q = unname(b$statistic),
+      df = unname(b$parameter), p_value = b$p.value, reject_5pct = b$p.value < .05,
+      variance_first_half = var(head(e, floor(length(e) / 2))),
+      variance_second_half = var(tail(e, floor(length(e) / 2))))
+  })
+  do.call(rbind, out)
+}
+
+# Estimate one primary regression model family, rather than M2/M3/M3_base
+# repeatedly. Only the illustrative example receives separate benchmark fits.
+prepare_regression <- function(prep, d, D, extended = TRUE, K = 1L) {
+  xr <- xreg_pair(prep, extended = extended, integrated = d + D > 0L, seasonal_difference = D > 0L, K = K)
+  if (d + D > 0L && ncol(xr$train)) {
+    xd <- xr$train
+    if (D) xd <- diff(xd, lag = 7)
+    if (d) xd <- diff(xd)
+    q <- qr(xd); good <- if (q$rank) sort(q$pivot[seq_len(q$rank)]) else integer()
+    xr$train <- xr$train[, good, drop = FALSE]; xr$future <- xr$future[, good, drop = FALSE]
+    stopifnot(qr(xd[, good, drop = FALSE])$rank == ncol(xr$train))
+  }
+  stopifnot(identical(colnames(xr$train), colnames(xr$future)))
+  xr
+}
+
+fallback_prediction <- function(prep, sparse = FALSE) {
+  y <- prep$history$sales; dates <- prep$history$date
+  if (!sparse) return(seasonal_naive(prep))
+  weekday <- (as.integer(dates) + 3L) %% 7L + 1L
+  z <- log1p(y); ok <- !is.na(z)
+  overall <- if (any(ok)) mean(z[ok]) else 0
+  level <- vapply(1:7, function(d) if (any(ok & weekday == d)) mean(z[ok & weekday == d]) else overall, numeric(1))
+  pmax(0, expm1(level[(as.integer(prep$future$date) + 3L) %% 7L + 1L]))
+}
+
+fit_primary <- function(prep, keep_fit = FALSE) {
+  start <- proc.time()[3]
+  y <- prep$history$sales; z <- log1p(y); observed <- y[!is.na(y)]
+  zero_fraction <- if (length(observed)) mean(observed == 0) else NA_real_
+  recent <- tail(y, 91L)
+  inactive <- length(observed) >= 365L && any(observed > 0) && zero_fraction >= .9 &&
+    length(recent) == 91L && !anyNA(recent) && all(recent == 0) &&
+    prep$missing_promo_future == 0L && all(prep$future$onpromotion == 0)
+  planned <- if (!length(observed)) "M0_no_history" else if (all(observed == 0)) "M0_all_zero" else
+    if (inactive) "M0_recent_inactive" else if (length(unique(observed)) == 1L) "M0_constant" else
+    if (length(observed) < 60L) "M0_short_history" else ""
+  sparse <- is.finite(zero_fraction) && zero_fraction >= .8
+  fallback <- if (planned %in% c("M0_no_history", "M0_all_zero", "M0_recent_inactive"))
+    rep(0, nrow(prep$future)) else fallback_prediction(prep, sparse = sparse && !nzchar(planned))
+  selected <- if (nzchar(planned)) planned else if (sparse) "M0_smoothed_weekday" else "M0_seasonal_naive"
+  selected_K <- 0L; f <- NULL; selected_xr <- NULL; candidates <- data.frame()
+  diag <- data.frame(); reason <- if (nzchar(planned)) planned else ""; notes <- character()
+  fourier_table <- data.frame(); identification <- NULL; order_screen <- NULL
+  dif <- list(d = 0L, D = 0L, n = length(regular_tail(z)), seas = NA, ocsb = NA, issue = "",
+    justification = "Planned historical-information fallback; unit-root selection not needed",
+    raw_level_kpss = NA, raw_trend_kpss = NA, raw_trend_adf = NA, adjusted_kpss = NA,
+    raw_acf7 = NA_real_, adjusted_acf7 = NA_real_, difference_acf1 = NA_real_, weekly_difference_acf7 = NA_real_)
+  prediction <- fallback
+  if (!nzchar(planned)) prediction <- tryCatch(withCallingHandlers({
+    fs <- screen_fourier(prep, z); fourier_table <- fs$table
+    dif <- identify_differences(z, fs$residual)
+    identification <- dif
+    os <- screen_orders(z, dif$d, dif$D, adjusted = fs$residual); order_screen <- os
+    notes <- c(notes, os$issue)
+    xr_by_K <- list(); model_fits <- list()
+    seed_K <- fs$seed
+    xr_by_K[[as.character(seed_K)]] <- prepare_regression(prep, dif$d, dif$D, K = seed_K)
+    cf <- fit_arima_candidates(z, xr_by_K[[as.character(seed_K)]]$train,
+      dif$d, dif$D, specs = os$specs, K = seed_K, warm_fit = os$pilot)
+    candidates <- cf$table; model_fits <- cf$fits
+    ranked <- function() {
+      good <- which(candidates$valid)
+      good[order(candidates$AICc[good], candidates$K[good], good)]
+    }
+    good <- ranked()
+    if (!length(good) && seed_K != 1L) {
+      # A complicated Fourier screen must not force a fallback when the
+      # parsimonious K=1 regression can still be estimated reliably.
+      xr_by_K[["1"]] <- prepare_regression(prep, dif$d, dif$D, K = 1L)
+      rescue <- fit_arima_candidates(z, xr_by_K[["1"]]$train, dif$d, dif$D,
+        specs = list(c(0L, 1L, 0L, 1L), c(1L, 0L, 1L, 0L)), K = 1L)
+      candidates <- rbind(candidates, rescue$table); model_fits <- c(model_fits, rescue$fits)
+      good <- ranked()
+    }
+    if (!length(good)) stop("No valid joint candidate in the primary order search")
+    winner <- good[1]
+    # Coordinate search: hold the winning ARMA order and d,D fixed while
+    # comparing the second Fourier K by the same full-data exact likelihood.
+    alt_K <- setdiff(fs$shortlist, unique(candidates$K))
+    for (K in alt_K) {
+      xr_by_K[[as.character(K)]] <- prepare_regression(prep, dif$d, dif$D, K = K)
+      s <- as.integer(unlist(candidates[winner, c("p", "q", "P", "Qseasonal")], use.names = FALSE))
+      alt <- fit_arima_candidates(z, xr_by_K[[as.character(K)]]$train,
+        dif$d, dif$D, specs = list(s), K = K, warm_fit = model_fits[[winner]])
+      candidates <- rbind(candidates, alt$table); model_fits <- c(model_fits, alt$fits)
+    }
+    good <- ranked(); winner <- good[1]
+    initial_diag <- innovation_diagnostics(residuals(model_fits[[winner]]),
+      sum(model_fits[[winner]]$arma[c(1, 2, 3, 4)]))
+    # One targeted neighbor only when both weekly-relevant diagnostic lags reject.
+    # The cap is six distinct joint candidates, excluding convergence retries.
+    if (nrow(candidates) < 6L && nrow(initial_diag) == 2L && all(initial_diag$reject_5pct)) {
+      s <- as.integer(unlist(candidates[winner, c("p", "q", "P", "Qseasonal")], use.names = FALSE))
+      dimension <- if (abs(os$pacf2[2]) > abs(os$acf2[2])) 1L else 2L
+      possibilities <- list()
+      for (j in c(dimension, setdiff(1:2, dimension), 3:4)) {
+        v <- s; upper <- if (j <= 2L) 2L else 1L
+        v[j] <- if (v[j] < upper) v[j] + 1L else max(0L, v[j] - 1L)
+        possibilities[[length(possibilities) + 1L]] <- v
+      }
+      K <- candidates$K[winner]
+      existing <- apply(candidates[candidates$K == K, c("p", "q", "P", "Qseasonal"), drop = FALSE], 1, paste, collapse = ",")
+      unused <- which(!vapply(possibilities, paste, collapse = ",", "") %in% existing)
+      if (length(unused)) {
+        extra <- fit_arima_candidates(z, xr_by_K[[as.character(K)]]$train, dif$d, dif$D,
+          specs = possibilities[unused[1]], K = K, warm_fit = model_fits[[winner]])
+        candidates <- rbind(candidates, extra$table); model_fits <- c(model_fits, extra$fits)
+      }
+    }
+    stopifnot(!anyDuplicated(candidates[c("K", "p", "q", "P", "Qseasonal")]))
+    candidates$candidate <- seq_len(nrow(candidates))
+    p <- NULL
+    for (i in ranked()) {
+      xr <- xr_by_K[[as.character(candidates$K[i])]]
+      possible <- tryCatch({
+        ff <- forecast::forecast(model_fits[[i]], h = nrow(prep$future),
+          xreg = if (ncol(xr$future)) xr$future else NULL)
+        v <- as.numeric(ff$mean)
+        if (length(v) != nrow(prep$future) || any(!is.finite(v))) stop("Nonfinite log forecast")
+        # Reject numerical overflow, not merely unusual but finite sales levels.
+        if (any(v > log(.Machine$double.xmax))) stop("Retransformation would overflow")
+        v
+      }, error = function(e) { notes <<- c(notes, paste("Forecast candidate", i, conditionMessage(e))); NULL })
+      if (!is.null(possible)) {
+        f <- model_fits[[i]]; selected_K <- candidates$K[i]; selected_xr <- xr; p <- possible; break
+      }
+    }
+    if (is.null(p)) stop("All valid candidate forecasts failed finiteness/length checks")
+    selected <- if (dif$d + dif$D) "M3_integrated" else "M3"
+    diag <- innovation_diagnostics(residuals(f), sum(f$arma[c(1, 2, 3, 4)]))
+    { out <- pmax(0, expm1(p)); if (any(!is.finite(out))) stop("Invalid retransformed forecast"); out }
+  }, warning = function(w) { notes <<- c(notes, conditionMessage(w)); invokeRestart("muffleWarning") }),
+  error = function(e) { reason <<- conditionMessage(e); f <<- NULL; selected_K <<- 0L;
+    selected <<- if (sparse) "M0_smoothed_weekday" else "M0_seasonal_naive"; diag <<- data.frame(); fallback })
+  lb <- function(lag) if (nrow(diag)) diag$p_value[match(lag, diag$lag)] else NA_real_
+  roots <- if (!is.null(f)) root_check(f) else c(AR_root = NA_real_, MA_root = NA_real_)
+  e <- if (!is.null(f)) regular_tail(as.numeric(residuals(f))) else numeric()
+  scale <- if (length(e) > 1L) max(mad(e), sd(e), .Machine$double.eps, na.rm = TRUE) else 1
+  extrapolation <- if (length(observed)) max(log1p(prediction)) > max(z, na.rm = TRUE) + 2 * sd(z, na.rm = TRUE) else FALSE
+  row <- data.frame(model = selected, K = selected_K,
+    AICc = if (!is.null(f)) f$aicc else NA_real_, BIC = if (!is.null(f)) f$bic else NA_real_,
+    LjungBox_p14 = lb(14L), LjungBox_p28 = lb(28L), d = dif$d, D = dif$D,
+    AR_root = roots[1], MA_root = roots[2],
+    observed_training = length(observed), missing_training = prep$missing_sales,
+    absent_dates = prep$absent_dates, missing_sales_rows = prep$missing_sales - prep$absent_dates,
+    zero_fraction = zero_fraction, recent_inactive = inactive,
+    missing_promo_train = prep$missing_promo_train, missing_promo_future = prep$missing_promo_future,
+    differencing_segment_n = dif$n, seasonal_strength_recommendation = dif$seas,
+    OCSB_recommendation = dif$ocsb, raw_level_KPSS_support = dif$raw_level_kpss,
+    raw_trend_KPSS_support = dif$raw_trend_kpss, raw_trend_ADF_support = dif$raw_trend_adf,
+    adjusted_KPSS_screen = dif$adjusted_kpss, differencing_reason = dif$justification,
+    differencing_issue = dif$issue,
+    order_screen_n = if (!is.null(order_screen)) order_screen$n else 0L,
+    attempted_candidates = if (nrow(candidates)) paste(paste0("K=", candidates$K, ":", candidates$order), collapse = "; ") else "none",
+    ML_calls = if (nrow(candidates)) sum(candidates$attempts) else 0L,
+    failed_fit_calls = if (nrow(candidates)) sum(candidates$failed_calls) else 0L,
+    successful_candidates = if (nrow(candidates)) sum(candidates$valid) else 0L,
+    rejected_candidates = if (nrow(candidates)) sum(!candidates$valid) else 0L,
+    order = if (!is.null(f)) paste(forecast::arimaorder(f), collapse = ",") else selected,
+    fallback = is.null(f), failure = reason,
+    warnings = paste(unique(c(notes[nzchar(notes)], if (nrow(candidates)) candidates$warning[nzchar(candidates$warning)])), collapse = "; "),
+    candidate_errors = if (nrow(candidates)) paste(candidates$error[nzchar(candidates$error)], collapse = "; ") else "",
+    large_residuals = if (length(e)) sum(abs(e - median(e)) > 6 * scale) else 0L,
+    forecast_extrapolation_flag = isTRUE(extrapolation),
+    fit_seconds = unname(proc.time()[3] - start), stringsAsFactors = FALSE, row.names = NULL)
+  list(prediction = prediction, row = row, diagnostics = diag, candidates = candidates,
+    fourier_screen = fourier_table, identification = identification,
+    fit = if (keep_fit) f else NULL, xr = if (keep_fit) selected_xr else NULL)
+}
+
+forecast_job <- function(key, context) {
+  h <- context$train[context$hi[[key]], , drop = FALSE]
+  f <- context$test[context$ti[[key]], , drop = FALSE]
+  h <- h[order(h$date), , drop = FALSE]; f <- f[order(f$date), , drop = FALSE]
+  keep <- key %in% context$detail_keys
+  prep <- prepare_series(h, f, context$holidays)
+  result <- fit_primary(prep, keep_fit = keep)
+  result$row$series <- key
+  diag <- result$diagnostics
+  if (nrow(diag)) { diag$series <- key; diag$model <- result$row$model }
+  list(id = f$id, sales = result$prediction, row = result$row,
+    diagnostics = diag,
+    candidate_log = if (nrow(result$candidates)) {
+      tab <- result$candidates; tab$series <- key; tab
+    } else NULL,
+    detail = if (keep) list(prep = prep, primary = result, key = key) else NULL)
+}
+
+add_example_models <- function(detail) {
+  # Report-only fits on ONE example; reuse its primary fit without refitting it.
+  prep <- detail$prep; z <- log1p(prep$history$sales); y <- prep$history$sales
+  primary <- detail$primary; selected <- primary$row$model
+  fits <- list(); candidates <- list(); diagnostics <- list()
+  if (selected != "M0") {
+    fits[selected] <- list(primary$fit); candidates[[selected]] <- primary$candidates
+    diagnostics[[selected]] <- primary$diagnostics
+  }
+  xr <- xreg_pair(prep, extended = TRUE, K = max(1L, primary$row$K))
+  obs <- !is.na(y)
+  for (m in c("M1", "M1_raw")) {
+    response <- if (m == "M1") z else y
+    dd <- data.frame(response = response[obs], xr$train[obs, , drop = FALSE], check.names = FALSE)
+    f <- lm(response ~ ., dd, na.action = na.fail)
+    fits[[m]] <- f
+    e <- rep(NA_real_, length(y)); e[obs] <- residuals(f)
+    diagnostics[[m]] <- innovation_diagnostics(e)
+  }
+  cf <- fit_arima_candidates(z, d = primary$row$d, D = primary$row$D)
+  fits["M2"] <- list(cf$fit); candidates[["M2"]] <- cf$table
+  if (!is.null(cf$fit)) diagnostics[["M2"]] <- innovation_diagnostics(
+    residuals(cf$fit), sum(cf$fit$arma[c(1, 2, 3, 4)]))
+  basic <- prepare_regression(prep, primary$row$d, primary$row$D, extended = FALSE)
+  if (!ncol(basic$train)) { cb <- cf } else {
+    cb <- fit_arima_candidates(z, basic$train, primary$row$d, primary$row$D)
+  }
+  fits["M3_base"] <- list(cb$fit); candidates[["M3_base"]] <- cb$table
+  if (!is.null(cb$fit)) diagnostics[["M3_base"]] <- innovation_diagnostics(
+    residuals(cb$fit), sum(cb$fit$arma[c(1, 2, 3, 4)]))
+  detail$result <- list(fits = fits, candidates = candidates, diagnostics = diagnostics)
+  detail$selected <- selected
+  detail
+}
+
+final_forecast <- function(train, test, holiday_calendar, workers = 1L, progress_every = 25L) {
+  hi <- split(seq_len(nrow(train)), pair_key(train))
+  ti <- split(seq_len(nrow(test)), pair_key(test))
+  keys <- sort(names(ti)); n <- length(keys)
+  stopifnot(all(keys %in% names(hi)), !anyDuplicated(test$id))
+  # The detail key is deterministic and needs no preliminary model estimation.
+  informative <- vapply(keys, function(k) {
+    y <- train$sales[hi[[k]]]; sum(!is.na(y)) >= 60L && length(unique(na.omit(y))) > 1L
+  }, TRUE)
+  informative_keys <- keys[informative]
+  mean_levels <- vapply(informative_keys, function(k) mean(train$sales[hi[[k]]], na.rm = TRUE), numeric(1))
+  informative_keys <- informative_keys[order(mean_levels, informative_keys)]
+  detail_keys <- if (length(informative_keys)) informative_keys[unique(pmax(1L, round(c(.2, .5, .9) * length(informative_keys))))] else character()
+  hd <- split(holiday_calendar, holiday_calendar$store_nbr)
+  holidays <- lapply(hd, function(x) list(data = x,
+    features = make_features(x$date, rep(0, nrow(x)), x$holiday, x$workday)))
+  context <- list(train = train[c("date", "store_nbr", "family", "sales", "onpromotion")],
+    test = test[c("date", "store_nbr", "family", "onpromotion", "id")],
+    hi = hi, ti = ti, holidays = holidays, detail_keys = detail_keys)
+  workers <- as.integer(workers)
+  if (length(workers) != 1L || is.na(workers) || workers < 1L) stop("workers must be a positive integer")
+  workers <- min(workers, 8L, n)
+  cluster <- NULL
+  if (workers > 1L) {
+    cluster <- tryCatch(parallel::makePSOCKcluster(workers, outfile = ""), error = function(e) {
+      warning("PSOCK workers unavailable; running sequentially: ", conditionMessage(e)); NULL
+    })
+    if (!is.null(cluster)) {
+      on.exit(parallel::stopCluster(cluster), add = TRUE)
+      helpers <- c("make_features", "prepare_series", "xreg_pair", "seasonal_naive", "regular_tail",
+        "identify_differences", "root_check", "fit_arima_candidates", "innovation_diagnostics",
+        "prepare_regression", "screen_fourier", "screen_orders", "fallback_prediction", "fit_primary", "forecast_job")
+      # Rebind exported function environments to worker globals; do not serialize
+      # the entire knitting environment or recreate a cluster inside a worker.
+      exports <- new.env(parent = emptyenv())
+      for (name in helpers) {
+        fun <- get(name, envir = environment(final_forecast)); environment(fun) <- .GlobalEnv
+        assign(name, fun, envir = exports)
+      }
+      assign("model_context", context, envir = exports)
+      parallel::clusterExport(cluster, c(helpers, "model_context"), envir = exports)
+      parallel::clusterSetRNGStream(cluster, iseed = 586L)
+      parallel::clusterEvalQ(cluster, {
+        if (!requireNamespace("forecast", quietly = TRUE)) stop("Worker cannot load forecast")
+        forecast_worker <- function(key) forecast_job(key, model_context)
+        NULL
+      })
+    } else workers <- 1L
+  }
+  ans <- vector("list", n); cumulative <- 0; success <- 0L; fallbacks <- 0L; failed_calls <- 0L; converged <- 0L
+  wall_start <- proc.time()[3]
+  progress <- list(); progress_every <- max(1L, as.integer(progress_every))
+  report <- function(done) {
+    wall <- unname(proc.time()[3] - wall_start)
+    line <- sprintf("Completed %d/%d | SARIMA series %d | valid candidates %d | fallbacks %d | failed joint attempts %d | fitting %.1f s | elapsed %.1f s | workers %d",
+                    done, n, success, converged, fallbacks, failed_calls, cumulative, wall, workers)
+    # stderr bypasses knitr's buffered ordinary output for live console progress.
+    cat(line, "\n", file = stderr()); flush(stderr())
+    progress[[length(progress) + 1L]] <<- data.frame(completed = done, total = n,
+      successful_SARIMA_series = success, valid_candidates = converged, fallback_series = fallbacks,
+      failed_fit_attempts = failed_calls, cumulative_fitting_seconds = cumulative, wall_seconds = wall, workers = workers)
+  }
+  report(0L)
+  for (first in seq.int(1L, n, by = progress_every)) {
+    index <- seq.int(first, min(first + progress_every - 1L, n))
+    batch <- if (is.null(cluster)) lapply(keys[index], forecast_job, context = context) else
+      parallel::parLapply(cluster, keys[index], "forecast_worker")
+    ans[index] <- batch
+    cumulative <- cumulative + sum(vapply(batch, function(x) x$row$fit_seconds, numeric(1)))
+    success <- success + sum(vapply(batch, function(x) !x$row$fallback, TRUE))
+    fallbacks <- fallbacks + sum(vapply(batch, function(x) x$row$fallback, TRUE))
+    failed_calls <- failed_calls + sum(vapply(batch, function(x) x$row$failed_fit_calls, numeric(1)))
+    converged <- converged + sum(vapply(batch, function(x) x$row$successful_candidates, numeric(1)))
+    report(max(index))
+  }
+  submission <- do.call(rbind, lapply(ans, function(x) data.frame(id = x$id, sales = x$sales)))
+  stopifnot(!anyDuplicated(submission$id), setequal(submission$id, test$id))
+  submission <- submission[match(test$id, submission$id), c("id", "sales")]
+  rownames(submission) <- NULL
+  stopifnot(nrow(submission) == nrow(test), identical(submission$id, test$id),
+    !anyNA(submission), all(is.finite(submission$sales)), all(submission$sales >= 0))
+  details <- Filter(Negate(is.null), lapply(ans, `[[`, "detail"))
+  detail <- if (length(details)) add_example_models(details[[1]]) else NULL
+  list(submission = submission, models = do.call(rbind, lapply(ans, `[[`, "row")),
+       diagnostics = do.call(rbind, lapply(ans, `[[`, "diagnostics")),
+       candidates = do.call(rbind, lapply(ans, `[[`, "candidate_log")),
+       progress = do.call(rbind, progress), detail = detail, representative_details = details)
+}
+
+stopifnot(max(train$date) == as.Date("2017-08-15"),
+          min(test$date) == as.Date("2017-08-16"), max(test$date) == as.Date("2017-08-31"),
+          !"sales" %in% names(test), !anyDuplicated(test$id))
+# Training key checks were already performed in the EDA; do not repeat them.
+stopifnot(duplicate_report$duplicate_key_rows[duplicate_report$dataset == "train"] == 0L,
+          duplicate_report$duplicate_key_rows[duplicate_report$dataset == "test"] == 0L)
+holiday_calendar <- make_holiday_calendar(stores, holidays_events,
+  seq(as.Date("2013-01-01"), max(test$date), by = "day"))
+available_cores <- suppressWarnings(parallel::detectCores(logical = FALSE))
+default_workers <- if (length(available_cores) == 1L && !is.na(available_cores)) min(2L, available_cores) else 1L
+workers <- as.integer(Sys.getenv("STORE_SALES_WORKERS", as.character(default_workers)))
+cat("Full-history primary regression/SARIMA fitting; requested workers:", workers, "\n")
+```
+
+All functions remain inside this R Markdown file and execute when knitted.
+Calendar/holiday features are cached per store; calendar matching replaces
+repeated merges. Missing targets remain NA. Missing promotions, if any, use that
+series' training-only median and are counted. No future sales are imputed or
+used in predictors. Known future promotion counts come from `test.csv`.
+
+# 6. Benchmark specifications
+
+The weekly seasonal-naive benchmark repeats the most recent observed training
+sale for each future weekday. If a weekday has no observations, it uses the
+last observed sale; an entirely unobserved history gives zero. This is a forecast
+rule, not zero-filling training data.
+
+OLS benchmarks use the same explanatory variables on log and raw scales:
+\[Z_t=\beta_0+\boldsymbol\beta^\top X_t+\varepsilon_t.\]
+Their standard errors are nominal when independence/homoskedasticity fail.
+Standalone SARIMA uses no external regressors:
+\[
+\phi(B)\Phi(B^7)(1-B)^d(1-B^7)^D Z_t
+=c+\theta(B)\Theta(B^7)a_t.
+\]
+An intercept is allowed only without differencing; standalone drift is allowed
+only for $d=1,D=0$. OLS, standalone SARIMA and core-only regression/SARIMA are
+fitted on one illustrative series, not repeatedly across all series. They do
+not determine final forecasts through validation or cross-scale AIC comparisons.
+
+# 7. Differencing and SARIMA identification
+
+AR($p$) models theoretically have PACF cutoffs and decaying ACF; MA($q$) models
+have ACF cutoffs and decaying PACF. ARMA patterns are typically mixed/decaying.
+Seasonal analogues occur at multiples of seven, but empirical patterns are
+ambiguous in finite samples.
+
+The unchanged, bounded identification procedure is:
+
+1. Fit preliminary full-history regression to account for deterministic effects.
+   Use a complete adjusted segment for diagnostic tests. Select $D=1$ only when
+   adjusted seasonal strength and OCSB both support it, with remaining lag-seven
+   dependence; otherwise retain weekday effects and $D=0$.
+2. Choose $d=1$ only when raw deterministic-specification ADF/KPSS and the adjusted
+   KPSS screen jointly support it. Retain the deterministic trend otherwise.
+   Disagreements and structural-break caveats are recorded. Fitted-residual
+   screens are heuristics; ordinary ADF critical values are not used to claim
+   cointegration from OLS residuals.
+3. Propose an error order with at most 18 low-dimensional stepwise fits, bounded
+   by $0\le p,q\le2$ and $0\le P,Q\le1$. Retain the original anchor orders
+   $(p,q,P,Q)=(1,0,1,0),(0,1,0,1),(1,1,0,1)$ and remove duplicates.
+4. Refit eligible candidates jointly by exact maximum likelihood on **all
+   historical observations**, retaining calendar gaps as NA. Compare Fourier
+   dimension at the winning error order. If both lag-14/28 innovation tests
+   reject, consider one unused neighboring order guided by short-lag ACF/PACF.
+   The cap remains six distinct joint candidates plus logged convergence retries.
+
+For $k$ estimated parameters and $n$ effective observations,
+\[
+\mathrm{AICc}=-2\ell+2k+\frac{2k(k+1)}{n-k-1},\qquad
+\mathrm{BIC}=-2\ell+k\log n.
+\]
+
+AICc is the primary penalized-likelihood criterion; BIC supplies a stronger
+complexity penalty. Comparisons require the same response data, differencing
+and likelihood convention. Approximate screening scores are not presented as
+exact joint likelihoods, and this coordinate search is not a global optimum
+claim. No model is selected merely because it passes a residual test.
+
+# 8. Regression with SARIMA errors and computation
+
+The primary specification is
+\[
+Z_t=\beta_0+\boldsymbol\beta^\top X_t+N_t,\qquad
+\phi(B)\Phi(B^7)(1-B)^d(1-B^7)^D N_t
+=\theta(B)\Theta(B^7)a_t.
+\]
+Regression coefficients and error parameters are estimated jointly. When
+$d+D>0$ the explicit trend is removed; seasonal differencing also removes
+weekday dummies. No redundant drift is added. Forecasts cover all 16 future
+days without observing intervening sales. Back-transformation is
+$\max\{0,\exp(\widehat Z)-1\}$, appropriate to the conditional log-scale target
+under RMSLE; it is not claimed to be an unbiased original-scale conditional mean.
+
+Converged fits must have finite coefficients/uncertainty, positive innovation
+variance, stationary AR and invertible MA components. Warm starts may reuse
+ARMA coefficients, never fixed OLS regression estimates. Failed starts receive
+a cold retry; invalid candidates/forecasts are rejected and logged.
+
+Fallbacks remain explicit and unchanged:
+
+- All-zero histories give zero; positive constants give their constant value.
+- Recent-inactivity zero forecasts require at least 365 observed days, a past
+  positive sale, at least 90% historical zeros, 91 consecutive observed zero days
+  at the end, and completely observed zero future promotions. Known future
+  promotion activity vetoes this rule; unpromoted reactivation remains a risk.
+- Fewer than 60 observations use seasonal naive. If joint fitting fails, use
+  seasonal naive or, for at least 80% zeros, a full-history log-weekday mean.
+
+Genuine zeros remain observed, small positive predictions are not rounded to
+zero, and unusual observations are not deleted. Finite extrapolations are flagged
+rather than capped; overflow/nonfinite predictions cause a fallback.
+
+```{r full-training-and-submission, include=FALSE}
+run_start <- proc.time()[3]
+final <- final_forecast(train, test, holiday_calendar, workers = workers)
+training_seconds <- unname(proc.time()[3] - run_start)
+submission <- final$submission
+stopifnot(nrow(final$models) == length(unique(pair_key(test))),
+          sum(final$models$observed_training) == sum(!is.na(train$sales)))
+stopifnot(identical(names(submission), c("id", "sales")),
+          nrow(submission) == nrow(test), identical(submission$id, test$id),
+          !anyDuplicated(submission$id), all(is.finite(submission$sales)),
+          all(submission$sales >= 0))
+write.csv(submission, "submission.csv", row.names = FALSE)
+cat("All training dates used. Models fitted for", nrow(final$models), "series.\n")
+cat("Elapsed model-fitting seconds:", round(training_seconds, 1), "\n")
+cat("Final submission rows:", nrow(submission), "\n")
+knitr::kable(as.data.frame(table(final$models$model)),
+             col.names = c("Selected model", "Number of series"), row.names = FALSE)
+```
+```{r fitting-progress-summary, include=FALSE}
+knitr::kable(final$progress, digits = 1, row.names = FALSE)
+cat("Total exact ML calls:", sum(final$models$ML_calls), "\n")
+cat("Fitting warnings recorded for", sum(nzchar(final$models$warnings)), "series.\n")
+```
+
+```{r report-computational-summary, results='asis'}
+report_last_progress <- tail(final$progress, 1)
+report_table(data.frame(Quantity = c("Series processed", "Successful joint-model series", "Fallback series",
+ "Valid model candidates", "Failed fitting attempts (including recovered retries)", "Wall time (minutes)", "Parallel workers"),
+ Value = c(format(nrow(final$models), big.mark = ","), format(sum(!final$models$fallback), big.mark = ","),
+ format(sum(final$models$fallback), big.mark = ","), format(report_last_progress$valid_candidates, big.mark = ","),
+ format(sum(final$models$failed_fit_calls), big.mark = ","), sprintf("%.1f", training_seconds / 60), as.character(report_last_progress$workers))),
+ "Final computational summary", digits = 1)
+```
+
+Console progress remains active. Parallel execution uses reproducible PSOCK
+workers, fixed series order and RNG streams; the default is at most two detected
+physical cores, with explicit requests capped at eight. Worker-startup failure
+falls back to sequential execution. Cumulative per-series fitting time differs
+from wall time under parallel execution.
+
+# 9. Representative model adequacy
+
+For one-step innovations, the Ljung-Box null is
+$H_0:\rho_a(1)=\cdots=\rho_a(h)=0$, with
+\[
+Q=n(n+2)\sum_{k=1}^{h}\frac{\widehat\rho_a(k)^2}{n-k}.
+\]
+At lags 14/28 the ARIMA reference is approximately
+$\chi^2_{h-p-q-P-Q}$. Regression coefficients and differencing are not counted
+as ARMA parameters. OLS uses a descriptive `fitdf=0` screen rather than an exact
+regression-adjusted test. Failing to reject does not prove white noise; many
+series/tests also create multiplicity concerns.
+
+```{r detailed-coefficients-and-diagnostics, include=FALSE}
+detail <- final$detail
+if (is.null(detail)) cat("All series used fallbacks; no estimable detailed example.\n")
+if (!is.null(detail)) {
+cat("Detailed full-training example:", detail$key, "\n")
+print(knitr::kable(detail$primary$fourier_screen, digits = 3, row.names = FALSE,
+  caption = "Fourier screening proxies; final joint AICc is in the candidate tables"))
+for (m in unique(c("M1", "M1_raw", "M2", "M3_base", detail$selected))) {
+  f <- detail$result$fits[[m]]
+  cat("\nModel", m, "\n")
+  if (is.null(f)) { cat("Fallback; no estimated model parameters.\n"); next }
+  if (inherits(f, "lm")) {
+    print(knitr::kable(coef(summary(f)), digits = 4))
+    e <- rep(NA_real_, nrow(detail$prep$history))
+    e[!is.na(detail$prep$history$sales)] <- residuals(f)
+    fitted_values <- rep(NA_real_, length(e))
+    fitted_values[!is.na(detail$prep$history$sales)] <- fitted(f)
+  } else {
+    se <- sqrt(diag(f$var.coef))
+    ct <- data.frame(estimate = coef(f), SE = se, z = coef(f) / se,
+      nominal_p = 2 * pnorm(-abs(coef(f) / se)))
+    print(knitr::kable(ct, digits = 4))
+    print(knitr::kable(detail$result$candidates[[m]], digits = 4, row.names = FALSE))
+    e <- as.numeric(residuals(f)); fitted_values <- as.numeric(fitted(f))
+  }
+  par(mfrow = c(2, 2))
+  plot(detail$prep$history$date, e, type = "l", main = paste(m, "Innovations / Residuals"), xlab = "Date", ylab = "Residual")
+  plot(fitted_values, e, pch = 16, cex = .4, main = "Residual versus Fitted", xlab = "Fitted", ylab = "Residual")
+  qqnorm(e, main = paste(m, "Normal Q–Q")); qqline(e)
+  plot(detail$prep$history$date, e^2, type = "l", main = "Squared Residuals", xlab = "Date", ylab = "Squared residual")
+  par(mfrow = c(1, 1))
+  ec <- regular_tail(e)
+  if (length(ec) > 40 && var(ec) > 0) {
+    plot_dependence(ec, paste(m, "innovations"))
+    sq <- Box.test(ec^2, lag = 14, type = "Ljung-Box")
+    cat("Squared-residual Ljung–Box: Q =", unname(sq$statistic),
+      "; df =", unname(sq$parameter), "; p =", sq$p.value, "\n")
+  }
+}
+for (m in names(detail$result$diagnostics)) {
+  dtab <- detail$result$diagnostics[[m]]
+  if (!is.null(dtab) && nrow(dtab)) {
+    cat("Ljung–Box diagnostics for", m, "\n")
+    print(knitr::kable(dtab, digits = 4, row.names = FALSE))
+  }
+}
+}
+```
+
+```{r report-model-comparison, results='asis'}
+if (!is.null(detail)) {
+ cat("Detailed fitted example: **", detail$key, "**.\n\n", sep = "")
+ report_model_comparison(detail)
+}
+```
+
+```{r report-primary-coefficients, results='asis'}
+if (!is.null(detail) && !is.null(detail$primary$fit)) {
+ report_fit <- detail$primary$fit
+ report_se <- sqrt(diag(report_fit$var.coef))
+ report_coefficients <- data.frame(Term = names(coef(report_fit)), Estimate = as.numeric(coef(report_fit)),
+   SE = report_se, `Nominal p` = report_p(2 * pnorm(-abs(coef(report_fit) / report_se))), check.names = FALSE)
+ report_table(report_coefficients, "Selected primary-model coefficients", digits = 4)
+}
+```
+
+For binary regressors, coefficients are conditional shifts in log(1 + sales);
+$\exp(\beta)-1$ expresses a proportional change in that transformed conditional
+level. These are associations, not causal promotion/holiday effects. Nominal
+coefficient tests are approximate and become less reliable with remaining
+innovation dependence; they are not used to delete terms automatically.
+
+```{r report-primary-residual-plots, fig.height=6.1}
+if (!is.null(detail) && !is.null(detail$primary$fit)) {
+ report_fit <- detail$primary$fit
+ report_e <- as.numeric(residuals(report_fit)); report_fitted <- as.numeric(fitted(report_fit))
+ par(mfrow = c(2, 2))
+ plot(detail$prep$history$date, report_e, type = "l", main = "One-step innovations", xlab = "Date", ylab = "Innovation")
+ plot(report_fitted, report_e, pch = 16, cex = .4, main = "Innovations versus fitted", xlab = "Fitted log sales", ylab = "Innovation")
+ qqnorm(report_e, main = "Normal Q-Q"); qqline(report_e)
+ plot(detail$prep$history$date, report_e^2, type = "l", main = "Squared innovations", xlab = "Date", ylab = "Squared innovation")
+ par(mfrow = c(1, 1))
+}
+```
+
+```{r report-primary-residual-dependence, fig.height=3.9}
+if (!is.null(detail) && !is.null(detail$primary$fit)) {
+ report_innovations <- regular_tail(as.numeric(residuals(detail$primary$fit)))
+ if (length(report_innovations) > 40 && var(report_innovations) > 0)
+   plot_dependence(report_innovations, "Primary innovations")
+}
+```
+
+```{r report-primary-ljung-box, results='asis'}
+if (!is.null(detail) && !is.null(detail$primary$fit)) {
+ report_diagnostics <- detail$primary$diagnostics
+ report_table(data.frame(Lag = report_diagnostics$lag, Q = report_diagnostics$Q,
+   df = report_diagnostics$df, p = report_p(report_diagnostics$p_value),
+   `5% decision` = report_decision(report_diagnostics$reject_5pct), check.names = FALSE),
+   "Primary-model innovation Ljung-Box tests", digits = 3)
+ cat("The primary example ", if (all(report_diagnostics$reject_5pct)) "rejects no-autocorrelation at both reported lags" else
+   if (any(report_diagnostics$reject_5pct)) "rejects no-autocorrelation at one reported lag" else "does not reject no-autocorrelation at either reported lag",
+   "; passing a test would still not prove white noise.\n\n", sep = "")
+ report_er <- regular_tail(as.numeric(residuals(detail$primary$fit)))
+ report_square_test <- Box.test(report_er^2, lag = 14, type = "Ljung-Box")
+ cat(sprintf("Diagnostic segment: %d days; mean innovation %.4f. First/second-half variances: %.4f / %.4f. Squared-innovation Ljung-Box p = %s.\n\n",
+ report_diagnostics$n[1], report_diagnostics$mean[1], report_diagnostics$variance_first_half[1],
+ report_diagnostics$variance_second_half[1], report_p(report_square_test$p.value)))
+}
+```
+
+These plots retain evidence of autocorrelation, variance changes and unusual
+innovations. Gaussianity is stronger than white noise, and a squared-innovation
+test is only a variance-dependence screen, not definitive ARCH identification.
+Internal missing residuals are not concatenated: ACF/PACF and tests use a
+contiguous complete residual segment. Integrated roots are intentional and
+excluded from ARMA stationarity/invertibility checks.
+
+```{r training-only-differencing-review, include=FALSE}
+if (!is.null(detail)) {
+zz <- regular_tail(log1p(detail$prep$history$sales))
+if (length(zz) >= 80 && var(zz) > 0) {
+  review <- rbind(run_tests(zz, "Example training log sales", TRUE),
+    run_tests(diff(zz), "Example first difference", FALSE),
+    run_tests(diff(zz, lag = 7), "Example weekly difference", FALSE))
+  knitr::kable(review, digits = 4, row.names = FALSE)
+  interpret_tests(review)
+  plot_dependence(diff(zz, lag = 7), "Weekly difference of training log sales")
+  knitr::kable(data.frame(identify_differences(log1p(detail$prep$history$sales))))
+}
+}
+```
+
+```{r report-primary-stationarity, results='asis'}
+if (!is.null(detail) && exists("review")) report_stationarity(review, "Fitted-example training-series sensitivity")
+```
+
+```{r representative-primary-residuals, include=FALSE}
+for (r in final$representative_details) {
+  if (is.null(r$primary$fit) || (!is.null(detail) && r$key == detail$key)) next
+  f <- r$primary$fit; e <- as.numeric(residuals(f))
+  cat("Representative primary model:", r$key, "K =", r$primary$row$K,
+      "order =", r$primary$row$order, "\n")
+  par(mfrow = c(1, 2))
+  plot(r$prep$history$date, e, type = "l", main = paste(r$key, "Innovations"), xlab = "Date", ylab = "Innovation")
+  qqnorm(e, main = "Innovation Normal Q-Q"); qqline(e)
+  par(mfrow = c(1, 1))
+  er <- regular_tail(e)
+  if (length(er) > 40 && var(er) > 0) plot_dependence(er, paste(r$key, "primary innovations"))
+  print(knitr::kable(r$primary$diagnostics, digits = 4, row.names = FALSE))
+}
+```
+
+# 10. Full-training results and limitations
+
+```{r full-training-model-summary, include=FALSE}
+model_summary <- final$models
+knitr::kable(as.data.frame(table(model_summary$model)),
+             col.names = c("Selected model", "Number of series"), row.names = FALSE)
+cat("All planned/fitting fallbacks:", sum(model_summary$fallback), "\n")
+cat("Missing historical targets across series:", sum(model_summary$missing_training), "\n")
+knitr::kable(head(model_summary[c("series", "model", "K", "order", "AICc", "BIC", "LjungBox_p14", "LjungBox_p28", "fallback")], 15), digits = 4, row.names = FALSE)
+finite_p <- is.finite(model_summary$LjungBox_p14)
+cat("Series with available Ljung–Box p-value:", sum(finite_p), "\n")
+if (any(finite_p)) {
+  cat("Fraction of reported lag-14 Ljung–Box tests rejecting at 5%:",
+      round(mean(model_summary$LjungBox_p14[finite_p] < 0.05), 3), "\n")
+}
+```
+```{r selected-specification-and-fallback-summary, include=FALSE}
+knitr::kable(as.data.frame(table(model_summary$d, model_summary$D)),
+  col.names = c("d", "D", "Number of series"), row.names = FALSE)
+knitr::kable(as.data.frame(table(model_summary$K[!model_summary$fallback])),
+  col.names = c("Selected Fourier K", "Primary series"), row.names = FALSE)
+cat("Failed joint fitting attempts (including recovered retries):", sum(model_summary$failed_fit_calls), "\n")
+cat("Rejected final candidates:", sum(model_summary$rejected_candidates), "\n")
+cat("Extreme positive forecast extrapolation flags:", sum(model_summary$forecast_extrapolation_flag), "\n")
+cat("Large innovation flags (retained observations):", sum(model_summary$large_residuals), "\n")
+primary_rows <- model_summary[!model_summary$fallback, ]
+cat("Invalid selected ARMA root checks:", sum(primary_rows$AR_root <= 1 | primary_rows$MA_root <= 1), "\n")
+cat("Absent calendar rows across series:", sum(model_summary$absent_dates), "\n")
+cat("Actual rows with missing sales:", sum(model_summary$missing_sales_rows), "\n")
+methods <- as.data.frame(table(model_summary$model, model_summary$failure))
+knitr::kable(methods[methods$Freq > 0, ], col.names = c("Method", "Fallback reason", "Series"), row.names = FALSE)
+```
+```{r all-series-ljung-box-summary, include=FALSE}
+if (!is.null(final$diagnostics) && nrow(final$diagnostics)) {
+  knitr::kable(aggregate(reject_5pct ~ lag, final$diagnostics, mean), digits = 3, row.names = FALSE)
+}
+failures <- model_summary[model_summary$fallback | nzchar(model_summary$candidate_errors) |
+                          nzchar(model_summary$differencing_issue), ]
+knitr::kable(head(failures[c("series", "fallback", "failure", "candidate_errors", "differencing_issue")], 15), row.names = FALSE)
+```
+
+```{r report-full-results, results='asis'}
+report_allocations <- as.data.frame(table(model_summary$model))
+report_allocations$Share <- 100 * report_allocations$Freq / nrow(model_summary)
+report_table(report_allocations, "Selected forecasting methods", digits = 1,
+  col.names = c("Model", "Series", "Share (%)"))
+report_table(as.data.frame(table(model_summary$K[!model_summary$fallback])), "Selected Fourier dimensions",
+  col.names = c("K", "Joint-model series"))
+report_table(as.data.frame(table(model_summary$d, model_summary$D)), "Differencing specifications (fallbacks coded 0/0)",
+  col.names = c("d", "D", "Series"))
+report_lb <- do.call(rbind, lapply(split(final$diagnostics, final$diagnostics$lag), function(x)
+ data.frame(Lag = x$lag[1], Tested = nrow(x), Rejections = sum(x$reject_5pct), Percent = 100 * mean(x$reject_5pct))))
+report_table(report_lb, "Aggregate innovation Ljung-Box rejection rates at 5%", digits = 1)
+report_error_text <- paste(model_summary$warnings, model_summary$candidate_errors, model_summary$differencing_issue)
+report_error_categories <- data.frame(Category = c("Nonfinite numerical start/optimization record", "Iteration/convergence record", "Bounded stepwise-search limit", "ADF/KPSS disagreement"),
+ Series = c(sum(grepl("non-finite|nonfinite", report_error_text, ignore.case = TRUE)),
+ sum(grepl("iteration|converg|code = [1-9]", report_error_text, ignore.case = TRUE)),
+ sum(grepl("stepwise|nmodels|model.*limit", report_error_text, ignore.case = TRUE)),
+ sum(grepl("disagree", model_summary$differencing_issue, ignore.case = TRUE))))
+report_table(report_error_categories, "Recorded issue categories (series counts; may overlap)")
+cat(sprintf("There were %d failed fitting attempts including recovered retries and %d rejected candidates. Warnings were recorded for %d series. Invalid selected ARMA-root checks: %d. ",
+ sum(model_summary$failed_fit_calls), sum(model_summary$rejected_candidates), sum(nzchar(model_summary$warnings)),
+ sum(model_summary$AR_root[!model_summary$fallback] <= 1 | model_summary$MA_root[!model_summary$fallback] <= 1)))
+cat(sprintf("Forecast extrapolation flags: %d; large-innovation flags retained: %d.\n\n",
+ sum(model_summary$forecast_extrapolation_flag), sum(model_summary$large_residuals)))
+report_unresolved <- model_summary[model_summary$fallback & !model_summary$model %in%
+ c("M0_all_zero", "M0_recent_inactive", "M0_constant", "M0_no_history", "M0_short_history"), ]
+if (nrow(report_unresolved)) report_table(head(report_unresolved[c("series", "model", "failure")], 3),
+ "Unresolved fitting-driven fallbacks", alignment = "p{3.8cm}lp{8cm}") else
+ cat("No numerical fitting failures forced a series-level fallback; the zero/inactivity rules remain separate from recovered numerical failures.\n\n")
+```
+
+The nontrivial rejection rates above remain evidence of incomplete innovation
+whitening, not a reason to claim model adequacy. Diagnostic flags and valid
+unusual observations are retained. AICc/BIC and in-sample tests cannot establish
+16-day forecast accuracy; structural changes, intermittent sales, holiday
+irregularities and unpromoted reactivation remain limitations.
+
+# 11. Kaggle forecasts
+
+The horizon is **August 16-31, 2017**. The existing export writes only
+`submission.csv`, with exactly `id,sales`, in original test order. No upload is
+performed and no hidden target values are used.
+
+Kaggle evaluates predictions using
+\[
+\mathrm{RMSLE}=\sqrt{\frac1n\sum_{i=1}^{n}
+ [\log(1+\widehat Y_i)-\log(1+Y_i)]^2}.
+\]
+This metric motivates the log-scale target but cannot be calculated for the
+hidden test outcomes inside the report.
+
+```{r submission-inspection, include=FALSE}
+cat("Final prediction count:", nrow(submission), "\n")
+knitr::kable(head(submission, 10), row.names = FALSE)
+```
+
+```{r report-submission, results='asis'}
+report_table(data.frame(Check = c("Predictions", "Unique IDs", "Original test order", "All finite", "All nonnegative"),
+ Result = c(format(nrow(submission), big.mark = ","), format(length(unique(submission$id)), big.mark = ","), ifelse(identical(submission$id, test$id), "Passed", "Failed"),
+ ifelse(all(is.finite(submission$sales)), "Passed", "Failed"), ifelse(all(submission$sales >= 0), "Passed", "Failed"))), "Submission checks")
+report_table(head(submission, 3), "Submission preview", digits = 4)
+```
+
+\clearpage
+
+# 12. Conclusions and reproducibility
+
+- Sales levels, weekday effects and variance vary over time; log1p compresses
+  large values without discarding observed zeros. Holiday/promotion associations
+  are contextual rather than causal.
+- Weekly dependence is supported by complementary calendar, STL and ACF evidence.
+  STL alone cannot identify a deterministic or stochastic trend.
+- ADF/KPSS disagreements and bandwidth sensitivity are retained. Differencing is
+  conservative and conditional on the specified deterministic components, not
+  an automatic response to upward trend or weekly seasonality.
+- Forecasts use joint regression with parsimonious SARIMA errors and all training
+  history. In-sample AICc drives a bounded search; BIC, convergence and root checks
+  supplement it. Explicit zero/inactivity/fitting fallbacks keep all series covered.
+- Remaining residual autocorrelation and variance instability qualify nominal
+  inference and model adequacy. A lower Kaggle RMSLE than the user-reported
+  baseline **0.47053** is not guaranteed; no new score is claimed.
+
+```{r forecasting-session-information, include=FALSE}
+sessionInfo()
+```
+
+```{r report-reproducibility, results='asis'}
+cat("**Environment:** ", R.version.string, "; ", R.version$platform, ". ", sep = "")
+cat("**Packages:** ", paste(vapply(c("forecast", "urca", "knitr", "rmarkdown"),
+ function(p) paste0(p, " ", as.character(packageVersion(p))), ""), collapse = "; "), ".\n\n", sep = "")
+```
+
+All statistical and forecasting functions are retained in this one source file.
+A normal knit executes the full workflow and the single CSV export. Presentation
+summaries introduce no new forecasting rules. Method references:
+[Arima](https://pkg.robjhyndman.com/forecast/reference/Arima.html),
+[order search](https://pkg.robjhyndman.com/forecast/reference/auto.arima.html),
+[ndiffs](https://pkg.robjhyndman.com/forecast/reference/ndiffs.html), and
+[nsdiffs](https://pkg.robjhyndman.com/forecast/reference/nsdiffs.html).
