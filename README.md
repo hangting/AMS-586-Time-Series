@@ -1,3 +1,5 @@
-For evaluation purpose, `submission.csv` should be submit to Kaggle.
+Kaggle Competition Link: https://www.kaggle.com/competitions/store-sales-time-series-forecasting/data
 
-`storesales.rmd` is the time series analysis process, including importing datasets, EDA, fitting models.
+`storesales.rmd` implies time series analysis processes, including importing datasets, EDA, fitting models, and prediction generation.
+
+`submission.csv` will store the predictions. For evaluation purpose, submit the file to the competition.
