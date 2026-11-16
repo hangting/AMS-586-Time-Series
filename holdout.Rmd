@@ -1,0 +1,266 @@
+---
+title: "Store Sales: Holdout Comparison of Separate, Family-Pooled and Global Models"
+author: "AMS 586"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+if (!requireNamespace("forecast", quietly = TRUE)) stop("Install package 'forecast'.")
+```
+
+# 1. Settings
+
+```{r settings}
+fit_start <- as.Date("2015-01-01")   # first date used for fitting
+h         <- 16L                     # forecast horizon (days), as in the competition
+origin    <- as.Date("2017-07-30")   # last training day; the next 16 days are held out
+pools     <- c("series", "family", "global")
+cache     <- "holdout_results.rds"   # saved results; delete after changing model code
+```
+
+The models are fitted on data up to July 30, 2017 and forecast July 31 to
+August 15, the last 16 days of the training data.
+
+# 2. Data import
+
+Same loading step and object names as `storesales.rmd`.
+
+```{r read-data}
+data_dir <- Sys.getenv("STORE_SALES_DATA", "store-sales-time-series-forecasting")
+if (!dir.exists(data_dir)) stop("Knit from the Kaggle folder containing the data directory.")
+csv_files <- sort(list.files(data_dir, pattern = "\\.csv$", full.names = TRUE))
+datasets <- setNames(lapply(csv_files, function(path) {
+  x <- read.csv(path, stringsAsFactors = FALSE)
+  if ("date" %in% names(x)) x$date <- as.Date(x$date)
+  x
+}), tools::file_path_sans_ext(basename(csv_files)))
+required <- c("train", "test", "stores", "oil", "holidays_events",
+              "transactions", "sample_submission")
+stopifnot(all(required %in% names(datasets)))
+train <- datasets$train; test <- datasets$test; stores <- datasets$stores
+holidays_events <- datasets$holidays_events
+```
+
+# 3. Features
+
+`make_holiday_calendar` and `make_features` are copied unchanged from
+`storesales.rmd`. When the files are merged, delete this chunk.
+
+```{r partner-feature-functions}
+make_holiday_calendar <- function(stores, events, dates) {
+  stopifnot(!anyDuplicated(stores$store_nbr))
+  out <- expand.grid(date = dates, store_nbr = stores$store_nbr)
+  out$date <- as.Date(out$date, origin = "1970-01-01")
+  out$holiday <- 0L; out$workday <- 0L
+  eligible <- !is.na(events$transferred) &
+    tolower(as.character(events$transferred)) == "false"
+  e <- events[eligible & events$type %in%
+    c("Holiday", "Transfer", "Additional", "Bridge", "Work Day"), ]
+  for (i in seq_len(nrow(e))) {
+    st <- switch(e$locale[i], National = stores$store_nbr,
+      Regional = stores$store_nbr[stores$state == e$locale_name[i]],
+      Local = stores$store_nbr[stores$city == e$locale_name[i]], integer())
+    ix <- out$date == e$date[i] & out$store_nbr %in% st
+    field <- if (e$type[i] == "Work Day") "workday" else "holiday"
+    out[[field]][ix] <- 1L
+  }
+  stopifnot(!anyDuplicated(paste(out$date, out$store_nbr)))
+  out
+}
+
+make_features <- function(date, promotion, holiday, workday) {
+  time <- as.numeric(date - as.Date("2013-01-01"))
+  x <- data.frame(trend = time / 365.25,
+    weekday = factor((as.integer(date) + 3L) %% 7L + 1L, levels = 1:7),
+    promo = log1p(promotion), holiday = holiday, workday = workday,
+    payday15 = as.integer(format(date, "%d") == "15"),
+    payday_end = as.integer(format(date + 1L, "%m") != format(date, "%m")))
+  for (k in 1:3) {
+    suffix <- if (k == 1L) "" else as.character(k)
+    x[[paste0("annual_sin", suffix)]] <- sin(2 * pi * k * time / 365.25)
+    x[[paste0("annual_cos", suffix)]] <- cos(2 * pi * k * time / 365.25)
+  }
+  x
+}
+```
+
+# 4. Modelling data
+
+Rows removed before fitting:
+
+- dates before `fit_start`;
+- each series' rows before its first sale (the store or family was not yet active).
+
+The response is `z = log(1 + sales)`.
+
+```{r panel}
+key_all <- paste(train$store_nbr, train$family, sep = " | ")
+pos <- train$sales > 0
+first_sale <- tapply(as.numeric(train$date[pos]), key_all[pos], min)
+start <- first_sale[key_all]
+keep <- train$date >= fit_start & !is.na(start) & as.numeric(train$date) >= start
+panel <- train[keep, ]
+panel$key <- key_all[keep]
+panel <- panel[order(panel$key, panel$date), ]
+panel$z <- log1p(panel$sales)
+
+hc <- make_holiday_calendar(stores, holidays_events,
+  seq(min(panel$date), max(test$date), by = "day"))
+m <- match(paste(panel$date, panel$store_nbr), paste(hc$date, hc$store_nbr))
+feats <- make_features(panel$date, panel$onpromotion, hc$holiday[m], hc$workday[m])
+X <- model.matrix(~ trend + weekday + promo + holiday + workday + payday15 + payday_end +
+  annual_sin + annual_cos + annual_sin2 + annual_cos2, feats)[, -1]
+
+rows_by_key <- split(seq_len(nrow(panel)), panel$key)
+```
+
+# 5. Model
+
+For series $s$ (one store and family) on day $t$:
+
+$$z_{s,t} = a_s + b_{g(s)}^\top x_{s,t} + n_{s,t}$$
+
+- $a_s$: intercept, one per series in every model.
+- $x_{s,t}$: trend, weekday, promotions, holiday, make-up workday, two payday flags, two annual Fourier pairs.
+- $n_{s,t}$: SARIMA error, one model per series.
+- $b_{g(s)}$: regression coefficients, shared within group $g$.
+
+The three models differ only in $g$:
+
+| Model | Coefficients shared across |
+|---|---|
+| `series` | nothing (one set per series) |
+| `family` | all stores within a product family |
+| `global` | all series |
+
+**Stage 1.** Estimate $a_s$ and $b_g$ by least squares. Subtracting each
+series' mean from $z$ and $x$ removes $a_s$, and regressing the demeaned
+values within each group gives the same $b_g$ as a regression with one dummy per series.
+
+```{r stage1}
+fit_stage1 <- function(tr, pool) {
+  i  <- which(tr); g <- panel$key[i]
+  n  <- rowsum(rep(1, length(i)), g)[, 1]
+  mx <- rowsum(X[i, ], g) / n                 # series means of the regressors
+  mz <- rowsum(panel$z[i], g)[, 1] / n        # series means of z
+  ig <- match(g, names(n))
+  Xd <- X[i, ] - mx[ig, ]; zd <- panel$z[i] - mz[ig]
+  pg <- switch(pool, series = g, family = panel$family[i], global = rep("all", length(i)))
+  groups <- split(seq_along(i), pg)
+  B <- t(vapply(groups, function(j) {
+    b <- lm.fit(Xd[j, , drop = FALSE], zd[j])$coefficients
+    b[is.na(b)] <- 0                          # regressors with no variation in this group
+    b
+  }, numeric(ncol(X))))
+  e <- rep(NA_real_, nrow(panel))             # stage 1 residuals, aligned with panel rows
+  for (p in names(groups)) {
+    j <- groups[[p]]
+    e[i[j]] <- zd[j] - Xd[j, , drop = FALSE] %*% B[p, ]
+  }
+  list(mx = mx, mz = mz, B = B, e = e, pool_of = tapply(pg, g, `[`, 1))
+}
+```
+
+**Stage 2.** For each series, `auto.arima` fits a SARIMA model with weekly
+period to the stage 1 residuals: $d$ and $D$ (0 or 1) by its built-in tests,
+then $p, q \le 2$ and $P, Q \le 1$ by AICc. It uses all of the series'
+residuals. December 25 is absent from the data each year, so those two or
+three residuals are filled with `forecast::na.interp` to give a complete daily series.
+
+**Forecast.** $\hat z = a_s + b_g^\top x + \hat n$, returned as $\max\{0, \exp(\hat z) - 1\}$.
+
+**Fallback rules.** These follow `storesales.rmd`, applied to the modelling
+data above, and are the same for all three models:
+
+| Case | Forecast |
+|---|---|
+| No history, or all zeros | 0 |
+| At least 365 days, at least 90% zeros, last 91 days all zero, no promotions in the forecast days | 0 |
+| Fewer than 60 days, or stage 2 fails | Last observed value for each weekday |
+
+```{r stage2}
+complete_residuals <- function(e, d) {
+  full <- seq(min(d), max(d), by = "day")       # every calendar day, including absent ones
+  forecast::na.interp(ts(e[match(full, d)], frequency = 7))
+}
+
+weekday_naive <- function(y, d, d_new) {
+  out <- rep(tail(y, 1), length(d_new))
+  for (j in seq_along(d_new)) {
+    v <- y[as.integer(d) %% 7L == as.integer(d_new[j]) %% 7L]
+    if (length(v)) out[j] <- tail(v, 1)
+  }
+  out
+}
+
+forecast_series <- function(r, origin, s1) {
+  d <- panel$date[r]
+  i_tr <- r[d <= origin]; i_te <- r[d > origin & d <= origin + h]
+  if (!length(i_te)) return(NULL)
+  y <- panel$sales[i_tr]; d_tr <- panel$date[i_tr]; d_te <- panel$date[i_te]
+  inactive <- length(y) >= 365 && mean(y == 0) >= 0.9 && all(tail(y, 91) == 0) &&
+    all(panel$onpromotion[i_te] == 0)
+  pred <- if (!length(y) || all(y == 0) || inactive) {
+    rep(0, length(i_te))
+  } else if (length(y) < 60) {
+    weekday_naive(y, d_tr, d_te)
+  } else tryCatch({
+    k <- panel$key[r[1]]
+    e <- complete_residuals(s1$e[i_tr], d_tr)
+    fit <- forecast::auto.arima(e, max.p = 2, max.q = 2,
+      max.P = 1, max.Q = 1, max.d = 1, max.D = 1, allowdrift = FALSE)
+    ef <- as.numeric(forecast::forecast(fit, h = h)$mean)
+    xf <- sweep(X[i_te, , drop = FALSE], 2, s1$mx[k, ])
+    day <- as.integer(as.numeric(d_te) - as.numeric(origin))
+    zhat <- s1$mz[[k]] + as.numeric(xf %*% s1$B[s1$pool_of[[k]], ]) + ef[day]
+    pmax(0, expm1(zhat))
+  }, error = function(err) weekday_naive(y, d_tr, d_te))
+  data.frame(key = panel$key[i_te], family = panel$family[i_te], date = d_te,
+    actual = panel$sales[i_te], pred = pred)
+}
+```
+
+# 6. Holdout evaluation
+
+The first knit fits every series under each model, which takes roughly an
+hour. The results are saved to disk and reloaded on later knits.
+
+```{r evaluate}
+if (file.exists(cache)) {
+  results <- readRDS(cache)
+} else {
+  runs <- list()
+  for (p in pools) {
+    s1 <- fit_stage1(panel$date <= origin, p)
+    out <- do.call(rbind, lapply(rows_by_key, forecast_series, origin = origin, s1 = s1))
+    runs[[p]] <- data.frame(model = p, out)
+    message("Finished ", p)
+  }
+  results <- do.call(rbind, runs)
+  saveRDS(results, cache)
+}
+```
+
+# 7. Results
+
+The score is the competition metric,
+$\mathrm{RMSLE} = \sqrt{\operatorname{mean}[(\log(1+\hat y) - \log(1+y))^2]}$; lower is better.
+
+```{r results}
+results$model <- factor(results$model, levels = pools)
+results$sq <- (log1p(results$pred) - log1p(results$actual))^2
+knitr::kable(data.frame(Model = pools, RMSLE = as.numeric(sqrt(tapply(results$sq, results$model, mean)))),
+  digits = 4, caption = "Holdout RMSLE by model")
+```
+
+```{r results-by-family}
+by_family <- sqrt(tapply(results$sq, list(results$family, results$model), mean))
+knitr::kable(by_family[order(-by_family[, "series"]), ], digits = 3,
+  caption = "Holdout RMSLE by product family")
+```
+
+These scores are not directly comparable with the Kaggle score: they exclude
+series that have never sold and use different dates.
