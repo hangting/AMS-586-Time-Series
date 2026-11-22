@@ -1,0 +1,1170 @@
+---
+title: "APPL_Prediction_v1"
+output: pdf_document
+date: "2026-11-22"
+---
+
+```{r}
+packageVersion("rlang")
+```
+
+
+```{r}
+aapl <- read.csv("MacroTrends_Data_Download_AAPL.csv", skip = 14)
+aapl$date <- as.Date(aapl$date)
+aapl <- aapl[order(aapl$date), c("date", "close")]
+
+stopifnot(!anyNA(aapl), !anyDuplicated(aapl$date))
+```
+
+
+```{r}
+daily_baseline <- data.frame(
+  forecast_date   = aapl$date,
+  target_date     = dplyr::lead(aapl$date),
+  predicted_close = aapl$close,
+  actual_close    = dplyr::lead(aapl$close)
+)
+
+baseline_2025 <- subset(
+  daily_baseline,
+  target_date >= as.Date("2025-01-01") &
+  target_date <  as.Date("2026-01-01")
+)
+
+baseline_2025$error <- baseline_2025$actual_close - baseline_2025$predicted_close
+baseline_2025$abs_error <- abs(baseline_2025$error)
+
+head(baseline_2025)
+
+```
+
+```{r}
+baseline_scores_2025 <- data.frame(
+  trading_days = nrow(baseline_2025),
+  RMSE = sqrt(mean(baseline_2025$error^2)),
+  MAE = mean(baseline_2025$abs_error),
+  within_5_dollars_pct = 100 * mean(baseline_2025$abs_error <= 5)
+)
+
+print(round(baseline_scores_2025, 3))
+```
+
+
+```{r}
+write.csv(baseline_2025, "AAPL_baseline_daily_2025.csv", row.names = FALSE)
+```
+
+
+```{r}
+# Step 2: Diagnose next-day AAPL forecast errors
+
+prices <- read.csv("MacroTrends_Data_Download_AAPL.csv", skip = 14)
+prices$date <- as.Date(prices$date)
+
+stopifnot(!anyDuplicated(prices$date))
+
+diagnostics <- baseline_2025
+target_rows <- match(diagnostics$target_date, prices$date)
+
+stopifnot(!anyNA(target_rows))
+diagnostics$target_open <- prices$open[target_rows]
+stopifnot(!anyNA(diagnostics$target_open))
+
+diagnostics$overnight_gap <- diagnostics$target_open -
+                             diagnostics$predicted_close
+
+diagnostics$intraday_move <- diagnostics$actual_close -
+                             diagnostics$target_open
+
+stopifnot(all(abs(diagnostics$overnight_gap +
+                  diagnostics$intraday_move -
+                  diagnostics$error) < 1e-8))
+
+moves <- list(
+  overnight = diagnostics$overnight_gap,
+  intraday = diagnostics$intraday_move,
+  full_day = diagnostics$error
+)
+
+movement_summary <- data.frame(
+  period = names(moves),
+  mean_abs_move_usd = sapply(moves, function(x) mean(abs(x))),
+  rms_move_usd = sapply(moves, function(x) sqrt(mean(x^2))),
+  row.names = NULL
+)
+
+print(movement_summary, digits = 4)
+
+
+ranked_rows <- order(diagnostics$abs_error, decreasing = TRUE)
+worst_10 <- diagnostics[head(ranked_rows, 10), ]
+
+worst_10$larger_move <- with(
+  worst_10,
+  ifelse(abs(overnight_gap) > abs(intraday_move), "Overnight",
+         ifelse(abs(intraday_move) > abs(overnight_gap), "Intraday", "Equal"))
+)
+
+worst_10 <- worst_10[, c(
+  "forecast_date", "target_date", "predicted_close",
+  "target_open", "actual_close", "overnight_gap",
+  "intraday_move", "error", "abs_error", "larger_move"
+)]
+
+print(worst_10, row.names = FALSE)
+
+tail_summary <- data.frame(
+  total_days = nrow(diagnostics),
+  worst_days = nrow(worst_10),
+  pct_of_total_squared_error =
+    100 * sum(worst_10$error^2) / sum(diagnostics$error^2),
+  intraday_larger_days = sum(worst_10$larger_move == "Intraday"),
+  overnight_larger_days = sum(worst_10$larger_move == "Overnight")
+)
+
+print(round(tail_summary, 2))
+
+write.csv(diagnostics, "AAPL_error_diagnostics_2025.csv", row.names = FALSE)
+write.csv(worst_10, "AAPL_worst_10_days_2025.csv", row.names = FALSE)
+```
+
+```{r}
+# Load AAPL and QQQ daily prices
+daily <- read.csv("MacroTrends_Data_Download_AAPL.csv", skip = 14)
+qqq <- read.csv("QQQ_daily.csv")
+
+daily$date <- as.Date(daily$date)
+qqq$date <- as.Date(qqq$date)
+
+daily <- daily[order(daily$date), ]
+qqq <- qqq[order(qqq$date), ]
+
+stopifnot(!anyDuplicated(daily$date), !anyDuplicated(qqq$date))
+
+# Calculate QQQ returns on its own trading calendar
+qqq$qqq_ret_1d <- qqq$qqq_close / dplyr::lag(qqq$qqq_close, 1) - 1
+qqq$qqq_ret_5d <- qqq$qqq_close / dplyr::lag(qqq$qqq_close, 5) - 1
+
+# Match QQQ features by date while preserving every AAPL trading day
+qqq_rows <- match(daily$date, qqq$date)
+daily$qqq_ret_1d <- qqq$qqq_ret_1d[qqq_rows]
+daily$qqq_ret_5d <- qqq$qqq_ret_5d[qqq_rows]
+
+# Build features available after the current trading session closes
+daily$aapl_ret_1d <- daily$close / dplyr::lag(daily$close, 1) - 1
+daily$aapl_ret_5d <- daily$close / dplyr::lag(daily$close, 5) - 1
+daily$intraday_return <- daily$close / daily$open - 1
+
+daily_range <- daily$high - daily$low
+daily$close_position <- (daily$close - daily$low) /
+  dplyr::na_if(daily_range, 0) - 0.5
+
+daily$volatility_20d <- zoo::rollapplyr(
+  daily$aapl_ret_1d, width = 20, FUN = sd, fill = NA
+)
+
+# Compare today's volume with the mean of the previous 20 sessions
+prior_avg_volume <- zoo::rollmeanr(
+  dplyr::lag(daily$volume), k = 20, fill = NA
+)
+daily$relative_volume <- daily$volume / prior_avg_volume
+
+# Keep future outcomes separate from all predictor lists
+daily$target_date <- dplyr::lead(daily$date)
+daily$actual_close <- dplyr::lead(daily$close)
+daily$next_return <- daily$actual_close / daily$close - 1
+```
+
+
+
+```{r}
+# Define feature sets before evaluating any models
+price_features <- c(
+  "aapl_ret_1d", "aapl_ret_5d", "intraday_return", "close_position"
+)
+
+feature_sets <- list(
+  AAPL_price = price_features,
+  AAPL_price_volatility = c(price_features, "volatility_20d"),
+  AAPL_price_volatility_volume = c(
+    price_features, "volatility_20d", "relative_volume"
+  ),
+  AAPL_price_QQQ = c(price_features, "qqq_ret_1d", "qqq_ret_5d")
+)
+
+# Evaluate by target date so the 2025 sample matches Step 1
+evaluation_rows <- which(
+  daily$target_date >= as.Date("2023-01-01") &
+  daily$target_date < as.Date("2026-01-01")
+)
+
+window_size <- 756L
+all_features <- unique(unlist(feature_sets, use.names = FALSE))
+
+# Check that all models can use the same dates and full training windows
+required_rows <- seq.int(
+  min(evaluation_rows) - window_size, max(evaluation_rows)
+)
+
+feature_values <- as.matrix(daily[required_rows, all_features])
+if (any(!is.finite(feature_values))) {
+  missing_columns <- colnames(feature_values)[
+    colSums(!is.finite(feature_values)) > 0
+  ]
+  stop("Missing or non-finite feature values in: ",
+       paste(missing_columns, collapse = ", "))
+}
+
+stopifnot(all(is.finite(daily$next_return[required_rows])))
+
+# Store one row per forecast origin and one column per model
+predictions <- daily[evaluation_rows, c("date", "target_date", "actual_close")]
+names(predictions)[1] <- "forecast_date"
+predictions$Baseline <- daily$close[evaluation_rows]
+
+for (model_name in names(feature_sets)) {
+  features_used <- feature_sets[[model_name]]
+  model_formula <- reformulate(features_used, response = "next_return")
+  predicted_close <- numeric(length(evaluation_rows))
+
+  for (j in seq_along(evaluation_rows)) {
+    i <- evaluation_rows[j]
+
+    # At today's close, yesterday is the latest fully labeled training row
+    train_rows <- seq.int(i - window_size, i - 1L)
+    fit <- lm(model_formula, data = daily[train_rows, ])
+
+    predicted_return <- predict(fit, newdata = daily[i, , drop = FALSE])
+    predicted_close[j] <- daily$close[i] * (1 + predicted_return)
+  }
+
+  predictions[[model_name]] <- predicted_close
+}
+```
+
+
+
+```{r}
+# Score all models on identical target dates
+model_names <- c("Baseline", names(feature_sets))
+predictions$year <- as.integer(format(predictions$target_date, "%Y"))
+score_rows <- list()
+
+for (yr in sort(unique(predictions$year))) {
+  period <- predictions[predictions$year == yr, ]
+  baseline_error <- period$actual_close - period$Baseline
+  baseline_rmse <- sqrt(mean(baseline_error^2))
+
+  for (model_name in model_names) {
+    error <- period$actual_close - period[[model_name]]
+    rmse <- sqrt(mean(error^2))
+
+    score_rows[[length(score_rows) + 1L]] <- data.frame(
+      year = yr,
+      model = model_name,
+      days = length(error),
+      RMSE = rmse,
+      MAE = mean(abs(error)),
+      RMSE_gain_vs_baseline = baseline_rmse - rmse,
+      within_5_dollars_pct = 100 * mean(abs(error) <= 5),
+      beats_baseline_days_pct = if (model_name == "Baseline") {
+        NA_real_
+      } else {
+        100 * mean(abs(error) < abs(baseline_error))
+      }
+    )
+  }
+}
+
+scores <- do.call(rbind, score_rows)
+
+# Print the 2025 results from lowest to highest RMSE
+scores_2025 <- subset(scores, year == 2025)
+scores_2025 <- scores_2025[order(scores_2025$RMSE), ]
+print(scores_2025, digits = 5, row.names = FALSE)
+
+# Compare annual RMSE to check whether the ranking repeats across years
+annual_rmse <- reshape(
+  scores[, c("model", "year", "RMSE")],
+  idvar = "model", timevar = "year", direction = "wide"
+)
+print(annual_rmse, digits = 5, row.names = FALSE)
+
+# Save both the daily predictions and the model comparison
+write.csv(predictions, "AAPL_step3_daily_predictions.csv", row.names = FALSE)
+write.csv(scores, "AAPL_step3_model_scores.csv", row.names = FALSE)
+```
+```{r}
+# Install the packages if they are missing
+for (pkg in c("httr2", "rstudioapi")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Enter credentials privately for the current R session
+Sys.setenv(
+  APCA_API_KEY_ID = rstudioapi::askForPassword("Alpaca API Key ID"),
+  APCA_API_SECRET_KEY = rstudioapi::askForPassword("Alpaca Secret Key")
+)
+```
+
+
+```{r}
+# Step 4A: Retrieve the final 30 minutes of one regular trading session
+sample_date <- "2025-12-15"
+market_tz <- "America/New_York"
+symbols <- c("AAPL", "QQQ")
+
+# Convert New York session times to UTC for the API request
+start_time <- as.POSIXct(
+  paste(sample_date, "15:30:00"), tz = market_tz
+)
+end_time <- as.POSIXct(
+  paste(sample_date, "15:59:59"), tz = market_tz
+)
+
+request <- httr2::request(
+  "https://data.alpaca.markets/v2/stocks/bars"
+) |>
+  httr2::req_headers(
+    `APCA-API-KEY-ID` = Sys.getenv("APCA_API_KEY_ID"),
+    `APCA-API-SECRET-KEY` = Sys.getenv("APCA_API_SECRET_KEY")
+  ) |>
+  httr2::req_url_query(
+    symbols = paste(symbols, collapse = ","),
+    timeframe = "1Min",
+    start = format(start_time, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    end = format(end_time, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    feed = "sip",
+    adjustment = "raw",
+    sort = "asc",
+    limit = 1000
+  )
+
+response <- httr2::req_perform(request)
+payload <- httr2::resp_body_json(response, simplifyVector = TRUE)
+
+# Check that the response contains both symbols
+stopifnot(all(symbols %in% names(payload$bars)))
+
+minute_sample <- do.call(rbind, lapply(symbols, function(symbol) {
+  bars <- payload$bars[[symbol]]
+  timestamps <- as.POSIXct(
+    bars$t, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC"
+  )
+
+  data.frame(
+    symbol = symbol,
+    time_et = format(timestamps, "%Y-%m-%d %H:%M", tz = market_tz),
+    open = bars$o,
+    close = bars$c,
+    volume = bars$v
+  )
+}))
+
+# Verify every expected minute before calculating the features
+expected_minutes <- format(
+  seq(start_time, by = "min", length.out = 30),
+  "%Y-%m-%d %H:%M", tz = market_tz
+)
+
+sample_summary <- do.call(rbind, lapply(symbols, function(symbol) {
+  x <- minute_sample[minute_sample$symbol == symbol, ]
+  x <- x[order(x$time_et), ]
+
+  if (!identical(x$time_et, expected_minutes)) {
+    stop("Missing or duplicated minute bars for ", symbol)
+  }
+
+  data.frame(
+    symbol = symbol,
+    bars = nrow(x),
+    first_minute = x$time_et[1],
+    last_minute = tail(x$time_et, 1),
+    return_30m_pct = 100 * (tail(x$close, 1) / x$open[1] - 1),
+    volume_30m = sum(x$volume)
+  )
+}))
+
+print(sample_summary, row.names = FALSE)
+```
+
+
+
+
+
+```{r}
+# Step 4B: Build one row of closing-window features per trading session
+
+# Get the actual closing time for each trading day in December 2025
+calendar_request <- httr2::request(
+  "https://paper-api.alpaca.markets/v2/calendar"
+) |>
+  httr2::req_headers(
+    `APCA-API-KEY-ID` = Sys.getenv("APCA_API_KEY_ID"),
+    `APCA-API-SECRET-KEY` = Sys.getenv("APCA_API_SECRET_KEY")
+  ) |>
+  httr2::req_url_query(start = "2025-12-01", end = "2025-12-31")
+
+calendar <- calendar_request |>
+  httr2::req_perform() |>
+  httr2::resp_body_json(simplifyVector = TRUE)
+
+stopifnot(nrow(calendar) > 0, !anyDuplicated(calendar$date))
+
+# Retrieve the final 30 one-minute bars for both symbols
+get_closing_features <- function(trading_date, close_time) {
+  close_et <- as.POSIXct(
+    paste(trading_date, close_time),
+    format = "%Y-%m-%d %H:%M",
+    tz = "America/New_York"
+  )
+  start_et <- close_et - 30 * 60
+  expected_times <- as.numeric(start_et) + (0:29) * 60
+
+  day_request <- request |>
+    httr2::req_url_query(
+      start = format(start_et, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+      end = format(close_et - 1, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    ) |>
+    httr2::req_retry(max_tries = 4)
+
+  bars_by_symbol <- day_request |>
+    httr2::req_perform() |>
+    httr2::resp_body_json(simplifyVector = TRUE)
+
+  result <- data.frame(
+    forecast_date = as.Date(trading_date),
+    session_close_et = close_time
+  )
+
+  for (symbol in c("AAPL", "QQQ")) {
+    bars <- bars_by_symbol$bars[[symbol]]
+    prefix <- tolower(symbol)
+    n_bars <- if (is.null(bars)) 0L else nrow(bars)
+
+    # Keep incomplete sessions visible and leave their features missing
+    result[[paste0(prefix, "_bars")]] <- n_bars
+    result[[paste0(prefix, "_ret_30m")]] <- NA_real_
+    result[[paste0(prefix, "_volume_30m")]] <- NA_real_
+
+    if (n_bars != 30L) next
+
+    times <- as.POSIXct(
+      bars$t, format = "%Y-%m-%dT%H:%M:%S", tz = "UTC"
+    )
+    idx <- order(times)
+    if (!identical(as.numeric(times[idx]), expected_times)) next
+
+    bars <- bars[idx, ]
+    result[[paste0(prefix, "_ret_30m")]] <- bars$c[30] / bars$o[1] - 1
+    result[[paste0(prefix, "_volume_30m")]] <- sum(bars$v)
+  }
+
+  result$relative_ret_30m <- result$aapl_ret_30m - result$qqq_ret_30m
+  result
+}
+
+# Build the monthly feature table in trading-date order
+daily_rows <- Map(get_closing_features, calendar$date, calendar$close)
+closing_features_dec <- do.call(rbind, daily_rows)
+closing_features_dec <- closing_features_dec[
+  order(closing_features_dec$forecast_date), 
+]
+rownames(closing_features_dec) <- NULL
+
+# Check coverage and compare the sample day with Step 4A
+print(data.frame(
+  trading_days = nrow(closing_features_dec),
+  complete_days = sum(!is.na(closing_features_dec$relative_ret_30m))
+))
+
+print(subset(closing_features_dec, forecast_date == as.Date("2025-12-15")))
+print(subset(closing_features_dec, session_close_et != "16:00"))
+
+write.csv(
+  closing_features_dec,
+  "AAPL_QQQ_closing_features_2025_12.csv",
+  row.names = FALSE
+)
+```
+
+
+
+```{r}
+# Step 4C: Download historical closing-window features with monthly checkpoints
+
+start_date <- "2019-11-01"
+end_date <- "2025-12-31"
+
+cache_dir <- "closing_window_monthly"
+dir.create(cache_dir, showWarnings = FALSE)
+
+# Get the official trading dates and closing times for the full period
+full_calendar <- calendar_request |>
+  httr2::req_url_query(start = start_date, end = end_date) |>
+  httr2::req_retry(max_tries = 4) |>
+  httr2::req_perform() |>
+  httr2::resp_body_json(simplifyVector = TRUE)
+
+full_calendar$date <- as.Date(full_calendar$date)
+full_calendar <- full_calendar[order(full_calendar$date), ]
+stopifnot(nrow(full_calendar) > 0, !anyDuplicated(full_calendar$date))
+
+calendar_by_month <- split(
+  full_calendar,
+  format(full_calendar$date, "%Y-%m")
+)
+
+required_cols <- c(
+  "forecast_date", "session_close_et",
+  "aapl_bars", "aapl_ret_30m", "aapl_volume_30m",
+  "qqq_bars", "qqq_ret_30m", "qqq_volume_30m",
+  "relative_ret_30m"
+)
+
+# A saved month must contain exactly one row per scheduled trading day
+valid_month <- function(x, sessions) {
+  all(required_cols %in% names(x)) &&
+    identical(as.character(x$forecast_date), as.character(sessions$date)) &&
+    identical(as.character(x$session_close_et), as.character(sessions$close))
+}
+
+monthly_data <- vector("list", length(calendar_by_month))
+names(monthly_data) <- names(calendar_by_month)
+
+for (month in names(calendar_by_month)) {
+  sessions <- calendar_by_month[[month]]
+  cache_file <- file.path(cache_dir, paste0(month, ".csv"))
+  monthly <- NULL
+
+  # Reuse the December sample from Step 4B when available
+  source_file <- cache_file
+  if (!file.exists(source_file) && month == "2025-12") {
+    source_file <- "AAPL_QQQ_closing_features_2025_12.csv"
+  }
+
+  if (file.exists(source_file)) {
+    saved <- read.csv(source_file, stringsAsFactors = FALSE)
+    if (valid_month(saved, sessions)) {
+      monthly <- saved[, required_cols]
+    }
+  }
+
+  if (is.null(monthly)) {
+    message("Downloading ", month, " (", nrow(sessions), " sessions)")
+
+    rows <- vector("list", nrow(sessions))
+    for (i in seq_len(nrow(sessions))) {
+      rows[[i]] <- get_closing_features(
+        as.character(sessions$date[i]),
+        sessions$close[i]
+      )
+      Sys.sleep(0.35)
+    }
+
+    monthly <- do.call(rbind, rows)
+    stopifnot(valid_month(monthly, sessions))
+  } else {
+    message("Using saved data for ", month)
+  }
+
+  # Write the checkpoint only after the entire month has been processed
+  monthly$forecast_date <- as.Date(monthly$forecast_date)
+  if (!identical(source_file, cache_file) || !file.exists(cache_file) ||
+      is.null(monthly_data[[month]]) && exists("saved") &&
+      !valid_month(saved, sessions)) {
+    tmp <- tempfile(tmpdir = cache_dir, fileext = ".csv")
+    write.csv(monthly, tmp, row.names = FALSE)
+    stopifnot(file.rename(tmp, cache_file))
+  }
+
+  monthly_data[[month]] <- monthly
+}
+
+# Combine all months and check that no trading dates were lost or duplicated
+closing_history <- do.call(rbind, unname(monthly_data))
+closing_history <- closing_history[order(closing_history$forecast_date), ]
+rownames(closing_history) <- NULL
+
+stopifnot(identical(closing_history$forecast_date, full_calendar$date))
+
+# Report feature coverage by year and retain incomplete sessions for inspection
+complete_features <- complete.cases(closing_history[, c(
+  "aapl_ret_30m", "aapl_volume_30m",
+  "qqq_ret_30m", "qqq_volume_30m"
+)])
+
+coverage <- aggregate(
+  cbind(trading_days = rep(1L, nrow(closing_history)),
+        complete_days = as.integer(complete_features)),
+  by = list(year = format(closing_history$forecast_date, "%Y")),
+  FUN = sum
+)
+
+coverage$missing_days <- coverage$trading_days - coverage$complete_days
+print(coverage, row.names = FALSE)
+
+if (any(!complete_features)) {
+  print(closing_history[!complete_features, c(
+    "forecast_date", "session_close_et", "aapl_bars", "qqq_bars"
+  )], row.names = FALSE)
+}
+
+write.csv(
+  closing_history,
+  "AAPL_QQQ_closing_features_history.csv",
+  row.names = FALSE
+)
+```
+
+
+
+```{r}
+# Step 4D: Test the incremental value of the closing-window relative return
+
+# Load saved intraday features and the original Step 3 predictions
+closing <- read.csv("AAPL_QQQ_closing_features_history.csv")
+closing$forecast_date <- as.Date(closing$forecast_date)
+
+results <- read.csv("AAPL_step3_model_scores.csv")  # Annual reference scores
+old_preds <- read.csv("AAPL_step3_daily_predictions.csv")
+old_preds$forecast_date <- as.Date(old_preds$forecast_date)
+old_preds$target_date <- as.Date(old_preds$target_date)
+
+stopifnot(
+  !anyDuplicated(closing$forecast_date),
+  !anyDuplicated(old_preds$forecast_date),
+  !anyDuplicated(daily$date),
+  !is.unsorted(daily$date)
+)
+
+# Match the intraday feature to the session in which it was observed
+model_daily <- daily
+closing_rows <- match(model_daily$date, closing$forecast_date)
+model_daily$relative_ret_30m <- closing$relative_ret_30m[closing_rows]
+
+# Use the exact forecast dates and actual outcomes scored in Step 3
+evaluation <- old_preds[, c(
+  "forecast_date", "target_date", "actual_close", "Baseline", "AAPL_price"
+)]
+origin_rows <- match(evaluation$forecast_date, model_daily$date)
+
+stopifnot(
+  !anyNA(origin_rows),
+  all(model_daily$target_date[origin_rows] == evaluation$target_date),
+  all(abs(model_daily$actual_close[origin_rows] - evaluation$actual_close) < 1e-8)
+)
+
+# Add only one predictor to the original price regression
+new_features <- c(
+  "aapl_ret_1d", "aapl_ret_5d", "intraday_return",
+  "close_position", "relative_ret_30m"
+)
+new_formula <- reformulate(new_features, response = "next_return")
+window_size <- 756L
+
+# Check feature coverage across every training and prediction window
+required_rows <- seq.int(min(origin_rows) - window_size, max(origin_rows))
+stopifnot(
+  min(required_rows) >= 1L,
+  all(is.finite(as.matrix(model_daily[required_rows, new_features]))),
+  all(is.finite(model_daily$next_return[required_rows]))
+)
+
+# Refit after each close using only outcomes observed by that session
+evaluation$AAPL_price_close30 <- NA_real_
+
+for (j in seq_along(origin_rows)) {
+  i <- origin_rows[j]
+  train_rows <- seq.int(i - window_size, i - 1L)
+
+  fit <- lm(new_formula, data = model_daily[train_rows, ])
+  predicted_return <- predict(fit, newdata = model_daily[i, , drop = FALSE])
+
+  evaluation$AAPL_price_close30[j] <-
+    model_daily$close[i] * (1 + predicted_return)
+}
+
+# Compare paired errors on the same target dates within each year
+evaluation$year <- format(evaluation$target_date, "%Y")
+by_year <- split(evaluation, evaluation$year)
+
+comparison_4d <- do.call(rbind, lapply(by_year, function(x) {
+  base_error <- x$actual_close - x$Baseline
+  price_error <- x$actual_close - x$AAPL_price
+  new_error <- x$actual_close - x$AAPL_price_close30
+
+  price_rmse <- sqrt(mean(price_error^2))
+  new_rmse <- sqrt(mean(new_error^2))
+
+  data.frame(
+    year = x$year[1],
+    days = nrow(x),
+    baseline_RMSE = sqrt(mean(base_error^2)),
+    price_RMSE = price_rmse,
+    close30_RMSE = new_rmse,
+    RMSE_gain_vs_price = price_rmse - new_rmse,
+    MAE_gain_vs_price = mean(abs(price_error)) - mean(abs(new_error)),
+    beats_price_days_pct = 100 * mean(abs(new_error) < abs(price_error))
+  )
+}))
+
+# Verify that the reference RMSE matches the saved Step 3 scores
+reference <- subset(results, model == "AAPL_price")
+reference_rows <- match(comparison_4d$year, as.character(reference$year))
+stopifnot(
+  !anyNA(reference_rows),
+  all(abs(comparison_4d$price_RMSE - reference$RMSE[reference_rows]) < 1e-8)
+)
+
+print(comparison_4d, digits = 5, row.names = FALSE)
+
+write.csv(evaluation, "AAPL_step4d_daily_predictions.csv", row.names = FALSE)
+write.csv(comparison_4d, "AAPL_step4d_scores.csv", row.names = FALSE)
+```
+
+
+```{r}
+# Step 4E: Test closing-window relative volume against the price-only model
+
+# Use the previous 20 regular sessions as the volume reference
+closing <- closing[order(closing$forecast_date), ]
+regular <- which(closing$session_close_et == "16:00")
+regular_volume <- closing$aapl_volume_30m[regular]
+
+prior_avg <- zoo::rollmeanr(
+  dplyr::lag(regular_volume), k = 20, fill = NA
+)
+
+# Zero represents neutral volume on an early-close session
+closing$log_relative_volume_30m <- 0
+closing$log_relative_volume_30m[regular] <- log(regular_volume / prior_avg)
+
+# Align each feature with its forecast origin
+idx <- match(model_daily$date, closing$forecast_date)
+model_daily$log_relative_volume_30m <- closing$log_relative_volume_30m[idx]
+
+# Use the same price predictors, forecast dates, and window as Step 4D
+volume_features <- c(
+  "aapl_ret_1d", "aapl_ret_5d", "intraday_return",
+  "close_position", "log_relative_volume_30m"
+)
+volume_formula <- reformulate(volume_features, response = "next_return")
+window_size <- 756L
+
+required_rows <- seq.int(min(origin_rows) - window_size, max(origin_rows))
+stopifnot(all(is.finite(as.matrix(model_daily[required_rows, volume_features]))))
+
+# Predict next-session returns and convert them to closing prices
+evaluation$AAPL_price_volume30 <- NA_real_
+
+for (j in seq_along(origin_rows)) {
+  i <- origin_rows[j]
+  train_rows <- seq.int(i - window_size, i - 1L)
+
+  fit <- lm(volume_formula, data = model_daily[train_rows, ])
+  predicted_return <- predict(fit, newdata = model_daily[i, , drop = FALSE])
+
+  evaluation$AAPL_price_volume30[j] <-
+    model_daily$close[i] * (1 + predicted_return)
+}
+
+# Compare paired errors against the price-only model for each year
+rmse <- function(error) sqrt(mean(error^2))
+
+comparison_4e <- do.call(rbind, lapply(split(evaluation, evaluation$year), function(x) {
+  price_error <- x$actual_close - x$AAPL_price
+  volume_error <- x$actual_close - x$AAPL_price_volume30
+
+  data.frame(
+    year = x$year[1],
+    days = nrow(x),
+    baseline_RMSE = rmse(x$actual_close - x$Baseline),
+    price_RMSE = rmse(price_error),
+    volume30_RMSE = rmse(volume_error),
+    RMSE_gain_vs_price = rmse(price_error) - rmse(volume_error),
+    MAE_gain_vs_price = mean(abs(price_error)) - mean(abs(volume_error)),
+    beats_price_days_pct = 100 * mean(abs(volume_error) < abs(price_error))
+  )
+}))
+
+print(comparison_4e, digits = 5, row.names = FALSE)
+
+write.csv(evaluation, "AAPL_step4e_daily_predictions.csv", row.names = FALSE)
+write.csv(comparison_4e, "AAPL_step4e_scores.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+# Step 5A: Compare rolling ridge regression with the existing price forecasts
+price_features <- c(
+  "aapl_ret_1d", "aapl_ret_5d", "intraday_return", "close_position"
+)
+
+window_size <- 756L
+lambda <- 1
+
+# Match each forecast to the trading day on which it was made
+stopifnot(
+  !is.unsorted(model_daily$date),
+  !anyDuplicated(model_daily$date),
+  !anyDuplicated(evaluation$forecast_date)
+)
+
+origin_rows <- match(evaluation$forecast_date, model_daily$date)
+stopifnot(
+  !anyNA(origin_rows),
+  all(origin_rows > window_size),
+  all(model_daily$target_date[origin_rows] == evaluation$target_date)
+)
+
+x <- as.matrix(model_daily[, price_features])
+y <- model_daily$next_return
+
+# Standardize each feature using only the current training window
+predict_ridge_close <- function(i) {
+  train <- seq.int(i - window_size, i - 1L)
+  x_train <- x[train, , drop = FALSE]
+  y_train <- y[train]
+
+  # The most recent training outcome must be known by today's close
+  stopifnot(
+    max(model_daily$target_date[train]) <= model_daily$date[i],
+    all(is.finite(x_train)),
+    all(is.finite(y_train)),
+    all(is.finite(x[i, ]))
+  )
+
+  center <- colMeans(x_train)
+  spread <- apply(x_train, 2, sd)
+  stopifnot(all(spread > 0))
+
+  z_train <- scale(x_train, center = center, scale = spread)
+  z_today <- (x[i, ] - center) / spread
+
+  # Penalize the slopes while leaving the intercept unpenalized
+  mean_return <- mean(y_train)
+  penalty <- window_size * lambda * diag(ncol(z_train))
+  slopes <- solve(
+    crossprod(z_train) + penalty,
+    crossprod(z_train, y_train - mean_return)
+  )
+
+  predicted_return <- mean_return + sum(z_today * slopes)
+  model_daily$close[i] * (1 + predicted_return)
+}
+
+evaluation$AAPL_ridge <- vapply(origin_rows, predict_ridge_close, numeric(1))
+
+# Score all three forecasts on exactly the same target dates
+model_names <- c("Baseline", "AAPL_price", "AAPL_ridge")
+score_period <- function(d, period) {
+  do.call(rbind, lapply(model_names, function(model) {
+    error <- d[[model]] - d$actual_close
+    stopifnot(all(is.finite(error)))
+
+    data.frame(
+      period = period,
+      model = model,
+      days = length(error),
+      RMSE = sqrt(mean(error^2)),
+      MAE = mean(abs(error)),
+      within_5_days = sum(abs(error) <= 5),
+      within_5_pct = 100 * mean(abs(error) <= 5)
+    )
+  }))
+}
+
+by_year <- split(evaluation, format(evaluation$target_date, "%Y"))
+annual_scores <- Map(score_period, by_year, names(by_year))
+scores_5a <- do.call(rbind, c(
+  unname(annual_scores),
+  list(score_period(evaluation, "All years"))
+))
+rownames(scores_5a) <- NULL
+
+write.csv(evaluation, "AAPL_step5a_daily_predictions.csv", row.names = FALSE)
+write.csv(scores_5a, "AAPL_step5a_scores.csv", row.names = FALSE)
+print(scores_5a, digits = 6, row.names = FALSE)
+```
+
+```{r}
+# Step 5B: Test shallow boosted trees on the same four price features
+# Run install.packages("xgboost") in the Console if needed.
+
+xgb_params <- list(
+  objective = "reg:squarederror",
+  tree_method = "hist",
+  max_depth = 2L,
+  min_child_weight = 30,
+  eta = 0.05,
+  max_bin = 64L,
+  base_score = 0,
+  nthread = 1L,
+  seed = 586L
+)
+
+predict_xgb_close <- function(i) {
+  train <- seq.int(i - window_size, i - 1L)
+
+  # All training outcomes must be observable by the forecast close.
+  stopifnot(max(model_daily$target_date[train]) <= model_daily$date[i])
+
+  dtrain <- xgboost::xgb.DMatrix(
+    data = x[train, , drop = FALSE],
+    label = y[train],
+    nthread = 1L
+  )
+  dtoday <- xgboost::xgb.DMatrix(
+    data = x[i, , drop = FALSE],
+    nthread = 1L
+  )
+
+  fit <- xgboost::xgb.train(
+    params = xgb_params,
+    data = dtrain,
+    nrounds = 30L,
+    verbose = 0L
+  )
+
+  predicted_return <- as.numeric(predict(fit, dtoday))
+  model_daily$close[i] * (1 + predicted_return)
+}
+
+evaluation$AAPL_xgb <- vapply(origin_rows, predict_xgb_close, numeric(1))
+stopifnot(all(is.finite(evaluation$AAPL_xgb)))
+
+# Score XGBoost on the same target dates as the existing forecasts.
+score_xgb <- function(d, period) {
+  error <- d$AAPL_xgb - d$actual_close
+  data.frame(
+    period = period,
+    model = "AAPL_xgb",
+    days = nrow(d),
+    RMSE = sqrt(mean(error^2)),
+    MAE = mean(abs(error)),
+    within_5_days = sum(abs(error) <= 5),
+    within_5_pct = 100 * mean(abs(error) <= 5)
+  )
+}
+
+by_year <- split(evaluation, format(evaluation$target_date, "%Y"))
+xgb_annual <- do.call(rbind, Map(score_xgb, by_year, names(by_year)))
+scores_5b <- rbind(scores_5a, xgb_annual, score_xgb(evaluation, "All years"))
+scores_5b <- scores_5b[order(scores_5b$period, scores_5b$RMSE), ]
+print(scores_5b, digits = 6, row.names = FALSE)
+
+# Use the baseline to identify the same ten dates for both models.
+d25 <- by_year[["2025"]]
+baseline_error <- d25$Baseline - d25$actual_close
+worst_10 <- head(order(abs(baseline_error), decreasing = TRUE), 10)
+
+d25$group <- "Other days"
+d25$group[worst_10] <- "Baseline worst 10"
+
+tail_scores <- do.call(rbind, lapply(split(d25, d25$group), function(d) {
+  data.frame(
+    group = d$group[1],
+    days = nrow(d),
+    baseline_RMSE = sqrt(mean((d$Baseline - d$actual_close)^2)),
+    xgb_RMSE = sqrt(mean((d$AAPL_xgb - d$actual_close)^2))
+  )
+}))
+print(tail_scores, digits = 6, row.names = FALSE)
+
+write.csv(evaluation, "AAPL_step5b_daily_predictions.csv", row.names = FALSE)
+write.csv(scores_5b, "AAPL_step5b_model_scores.csv", row.names = FALSE)
+write.csv(tail_scores, "AAPL_step5b_tail_scores_2025.csv", row.names = FALSE)
+```
+
+
+```{r}
+# Step 6A: Forecast the closing price after the opening price is observed
+prices <- read.csv("MacroTrends_Data_Download_AAPL.csv", skip = 14)
+prices$date <- as.Date(prices$date)
+prices <- prices[order(prices$date), c("date", "open", "close")]
+stopifnot(!anyNA(prices$date), !anyDuplicated(prices$date))
+
+# Build each feature using information available at the opening forecast time.
+prices$previous_close <- c(NA_real_, head(prices$close, -1))
+prices$overnight_return <- prices$open / prices$previous_close - 1
+prices$intraday_return <- prices$close / prices$open - 1
+
+# Use the exact target dates from Step 5B for a paired comparison.
+target_rows <- match(as.Date(evaluation$target_date), prices$date)
+window_size <- 756L
+
+stopifnot(
+  !anyNA(target_rows),
+  !anyDuplicated(target_rows),
+  all(target_rows > window_size + 1L),
+  isTRUE(all.equal(prices$close[target_rows], evaluation$actual_close,
+                   check.attributes = FALSE)),
+  isTRUE(all.equal(prices$previous_close[target_rows], evaluation$Baseline,
+                   check.attributes = FALSE))
+)
+
+# Train through yesterday's close and predict today's open-to-close return.
+predict_from_open <- function(i) {
+  train_rows <- seq.int(i - window_size, i - 1L)
+  train <- prices[train_rows, c("overnight_return", "intraday_return")]
+  stopifnot(all(is.finite(as.matrix(train))),
+            is.finite(prices$overnight_return[i]))
+
+  fit <- lm(intraday_return ~ overnight_return, data = train)
+  today <- data.frame(overnight_return = prices$overnight_return[i])
+  predicted_return <- as.numeric(predict(fit, newdata = today))
+
+  prices$open[i] * (1 + predicted_return)
+}
+
+open_eval <- data.frame(
+  target_date = prices$date[target_rows],
+  actual_close = prices$close[target_rows],
+  Previous_close = prices$previous_close[target_rows],
+  Opening_price = prices$open[target_rows],
+  Opening_gap_regression = vapply(target_rows, predict_from_open, numeric(1))
+)
+
+# Compare the two opening forecasts and retain the prior-close reference.
+score_open_period <- function(d, period) {
+  models <- c("Previous_close", "Opening_price", "Opening_gap_regression")
+  open_rmse <- sqrt(mean((d$Opening_price - d$actual_close)^2))
+
+  do.call(rbind, lapply(models, function(model) {
+    error <- d[[model]] - d$actual_close
+    rmse <- sqrt(mean(error^2))
+
+    data.frame(
+      period = period,
+      model = model,
+      days = nrow(d),
+      RMSE = rmse,
+      MAE = mean(abs(error)),
+      within_5_days = sum(abs(error) <= 5),
+      within_5_pct = 100 * mean(abs(error) <= 5),
+      RMSE_gain_vs_open = if (model == "Previous_close") NA_real_ else open_rmse - rmse
+    )
+  }))
+}
+
+open_years <- split(open_eval, format(open_eval$target_date, "%Y"))
+open_annual <- Map(score_open_period, open_years, names(open_years))
+open_scores <- do.call(rbind, c(
+  unname(open_annual),
+  list(score_open_period(open_eval, "All years"))
+))
+rownames(open_scores) <- NULL
+
+write.csv(open_eval, "AAPL_step6a_open_predictions.csv", row.names = FALSE)
+write.csv(open_scores, "AAPL_step6a_open_scores.csv", row.names = FALSE)
+print(open_scores, digits = 6, row.names = FALSE)
+```
+
+```{r}
+# Step 6B: Evaluate the unchanged opening model on the 2026 CSV period.
+start_date <- as.Date("2026-01-01")
+end_date <- as.Date("2026-11-06")
+window_size <- 756L
+
+rows_2026 <- which(prices$date >= start_date & prices$date <= end_date)
+stopifnot(length(rows_2026) > 0L, all(rows_2026 > window_size + 1L))
+
+# Refit each day using only the preceding 756 completed trading sessions.
+open_eval_2026 <- data.frame(
+  target_date = prices$date[rows_2026],
+  actual_close = prices$close[rows_2026],
+  Previous_close = prices$previous_close[rows_2026],
+  Opening_price = prices$open[rows_2026],
+  Opening_gap_regression = vapply(rows_2026, predict_from_open, numeric(1))
+)
+
+# Use the same scoring function as in Step 6A.
+scores_6b <- score_open_period(open_eval_2026, "2026 through Nov 6")
+print(scores_6b, digits = 6, row.names = FALSE)
+
+# Compare both opening forecasts on each individual trading day.
+open_error <- abs(open_eval_2026$Opening_price - open_eval_2026$actual_close)
+gap_error <- abs(open_eval_2026$Opening_gap_regression - open_eval_2026$actual_close)
+
+paired_6b <- data.frame(
+  days = nrow(open_eval_2026),
+  days_gap_model_closer = sum(gap_error < open_error),
+  days_tied = sum(gap_error == open_error),
+  MAE_gain_vs_open = mean(open_error - gap_error),
+  gap_model_days_outside_5 = sum(gap_error > 5)
+)
+print(paired_6b, digits = 6, row.names = FALSE)
+
+write.csv(open_eval_2026, "AAPL_step6b_open_predictions_2026.csv", row.names = FALSE)
+write.csv(scores_6b, "AAPL_step6b_open_scores_2026.csv", row.names = FALSE)
+```
+
+```{r}
+# Step 7: Record the opening update for the November 23 forecast.
+record_nov23_open <- function() {
+  market_tz <- "America/New_York"
+  target_date <- "2026-11-23"
+  previous_close <- 342.56
+
+  # Freeze the coefficients fitted through November 20.
+  intercept <- 0.00104003
+  gap_slope <- -0.18648603
+
+  output_file <- "AAPL_open_forecast_2026-11-23.csv"
+
+  # Return the original record if this function is run again.
+  if (file.exists(output_file)) {
+    return(read.csv(output_file))
+  }
+
+  session_open <- as.POSIXct(paste(target_date, "09:30:00"), tz = market_tz)
+  session_close <- as.POSIXct(paste(target_date, "16:00:00"), tz = market_tz)
+  in_session <- function(time) time >= session_open && time < session_close
+
+  if (!in_session(Sys.time())) {
+    stop("Record the opening forecast during the November 23 regular session.")
+  }
+
+  opening_price <- as.numeric(readline("Enter the official AAPL opening price: "))
+  stopifnot(length(opening_price) == 1L, is.finite(opening_price), opening_price > 0)
+
+  issued_at <- Sys.time()
+  stopifnot(in_session(issued_at))
+
+  overnight_return <- opening_price / previous_close - 1
+  predicted_close <- opening_price * (1 + intercept + gap_slope * overnight_return)
+
+  record <- data.frame(
+    target_date = target_date,
+    issued_at_et = format(issued_at, "%Y-%m-%d %H:%M:%S %Z", tz = market_tz),
+    previous_close = previous_close,
+    official_open = opening_price,
+    overnight_gap_pct = 100 * overnight_return,
+    opening_baseline = opening_price,
+    gap_model_forecast = round(predicted_close, 2)
+  )
+
+  write.csv(record, output_file, row.names = FALSE)
+  record
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

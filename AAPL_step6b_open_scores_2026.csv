@@ -1,0 +1,4 @@
+"period","model","days","RMSE","MAE","within_5_days","within_5_pct","RMSE_gain_vs_open"
+"2026 through Nov 6","Previous_close",214,4.92249480380203,3.56263551401869,162,75.7009345794392,NA
+"2026 through Nov 6","Opening_price",214,4.1189908623714,3.11035046728972,172,80.3738317757009,0
+"2026 through Nov 6","Opening_gap_regression",214,4.09625790899629,3.05858921165914,175,81.7757009345794,0.0227329533751099
