@@ -10,7 +10,7 @@ Structures: regression coefficients estimated per series(store x product family)
 
 selection.Rmd is an improved version of holdout.rmd which adds another testing/training window, tests starting from 2013 vs 2015, and does variable selection on the covariates.
 
-Because of the time taken to perform all the permutations of model selection on both storesales_holdout.rmd and selection.rmd, the model results are stored in the _cache folders. If you change the model code, delete the affected cache files, or the old results will be reused. Also, you need to unzip selection_cache to before it is usable.
+Because of the time taken to perform all the permutations of model selection on both storesales_holdout.rmd and selection.rmd, the model results are stored in the _cache folders. If you change the model code, delete the affected cache files, or the old results will be reused.
 
 Current Scores: 
 - 0.46833. (from storesales.rmd)
