@@ -1,0 +1,475 @@
+---
+title: "Store Sales: Covariate and Start-Date Selection"
+author: "AMS 586"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+if (!requireNamespace("forecast", quietly = TRUE)) stop("Install package 'forecast'.")
+```
+
+# 1. Settings
+
+```{r settings}
+workers    <- as.integer(Sys.getenv("STORE_SALES_WORKERS", "4"))  # cores used for stage 2
+h          <- 16L                                        # forecast horizon (days)
+origins    <- as.Date(c("2017-07-14", "2017-07-30"))     # last training day of each window
+start_full <- as.Date("2013-01-01")                      # default fitting start
+start_late <- as.Date("2015-01-01")                      # alternative tested in A3
+pools      <- c("series", "family", "global")
+blocks_all <- c("holidays", "christmas", "mothers", "quake", "promo_gap")
+drop_rule  <- 0.005                                      # A2: required improvement to drop a block
+start_rule <- 0.02                                       # A3: required improvement to adopt 2015
+cache_dir  <- "selection_cache"                          # one file per run; delete files after changing model code
+dir.create(cache_dir, showWarnings = FALSE)
+```
+
+Two test windows: fit to July 14 and forecast July 15 to 30; fit to July 30
+and forecast July 31 to August 15. Each specification is scored by the RMSLE
+pooled over both windows, and every run is saved, so an interrupted knit
+resumes where it stopped.
+
+# 2. Data import
+
+Same loading step and object names as `storesales.rmd`.
+
+```{r read-data}
+data_dir <- Sys.getenv("STORE_SALES_DATA", "store-sales-time-series-forecasting")
+if (!dir.exists(data_dir)) stop("Knit from the Kaggle folder containing the data directory.")
+csv_files <- sort(list.files(data_dir, pattern = "\\.csv$", full.names = TRUE))
+datasets <- setNames(lapply(csv_files, function(path) {
+  x <- read.csv(path, stringsAsFactors = FALSE)
+  if ("date" %in% names(x)) x$date <- as.Date(x$date)
+  x
+}), tools::file_path_sans_ext(basename(csv_files)))
+required <- c("train", "test", "stores", "oil", "holidays_events",
+              "transactions", "sample_submission")
+stopifnot(all(required %in% names(datasets)))
+train <- datasets$train; test <- datasets$test; stores <- datasets$stores
+holidays_events <- datasets$holidays_events; oil <- datasets$oil
+# Data correction: Good Friday 2013 was March 29 (the file has April 29, a Monday)
+holidays_events$date[holidays_events$description == "Viernes Santo" &
+  holidays_events$date == as.Date("2013-04-29")] <- as.Date("2013-03-29")
+```
+
+# 3. Covariates
+
+All covariates are built on a store-by-date calendar from 2013-01-01 to
+2017-08-31; promotions are added per row.
+
+| Group | Covariates | Role |
+|---|---|---|
+| Fixed | trend, weekday dummies, log(1 + promotions) | always included |
+| Tested (A1) | 1 to 3 annual Fourier pairs; smoothed oil; payday dummies (15th, month end) | best combination by pooled RMSLE |
+| Block `holidays` | one dummy per national holiday (its transfers included); bridge days; make-up workdays; one regional/local holiday dummy | default; removing it reverts to the single holiday flag of `storesales.rmd` |
+| Block `christmas` | holiday shopping season (Dec 16 to 24, 26, 30, 31, Jan 2 to 3); January 1 | default |
+| Block `mothers` | Mother's Day | default |
+| Block `quake` | first week after the 2016 earthquake (all stores); 8 weeks (Manabí stores) | default |
+| Block `promo_gap` | before April 2014, when promotions were not recorded | default |
+
+Smoothed oil is the mean of the last 30 available prices, carried forward to
+weekends and missing days.
+
+`make_holiday_calendar` is copied unchanged from `storesales.rmd`; it gives
+the single holiday flag used when the `holidays` block is removed.
+
+```{r storesales-holiday-function}
+make_holiday_calendar <- function(stores, events, dates) {
+  stopifnot(!anyDuplicated(stores$store_nbr))
+  out <- expand.grid(date = dates, store_nbr = stores$store_nbr)
+  out$date <- as.Date(out$date, origin = "1970-01-01")
+  out$holiday <- 0L; out$workday <- 0L
+  eligible <- !is.na(events$transferred) &
+    tolower(as.character(events$transferred)) == "false"
+  e <- events[eligible & events$type %in%
+    c("Holiday", "Transfer", "Additional", "Bridge", "Work Day"), ]
+  for (i in seq_len(nrow(e))) {
+    st <- switch(e$locale[i], National = stores$store_nbr,
+      Regional = stores$store_nbr[stores$state == e$locale_name[i]],
+      Local = stores$store_nbr[stores$city == e$locale_name[i]], integer())
+    ix <- out$date == e$date[i] & out$store_nbr %in% st
+    field <- if (e$type[i] == "Work Day") "workday" else "holiday"
+    out[[field]][ix] <- 1L
+  }
+  stopifnot(!anyDuplicated(paste(out$date, out$store_nbr)))
+  out
+}
+```
+
+```{r calendar}
+dates <- seq(start_full, max(test$date), by = "day")
+cal <- expand.grid(date = dates, store_nbr = stores$store_nbr)
+cal$date <- as.Date(cal$date, origin = "1970-01-01")
+cal_state <- stores$state[match(cal$store_nbr, stores$store_nbr)]
+time <- as.numeric(cal$date - start_full)
+
+C <- data.frame(trend = time / 365.25)
+weekday <- (as.integer(cal$date) + 3L) %% 7L + 1L            # 1 = Monday, as in storesales.rmd
+for (k in 2:7) C[[paste0("wd", k)]] <- as.integer(weekday == k)
+for (k in 1:3) {
+  C[[paste0("sin", k)]] <- sin(2 * pi * k * time / 365.25)
+  C[[paste0("cos", k)]] <- cos(2 * pi * k * time / 365.25)
+}
+C$payday15   <- as.integer(format(cal$date, "%d") == "15")
+C$payday_end <- as.integer(format(cal$date + 1L, "%m") != format(cal$date, "%m"))
+
+# Oil: trailing mean of the last 30 available prices
+o  <- oil[!is.na(oil$dcoilwtico), ]; o <- o[order(o$date), ]
+cs <- cumsum(o$dcoilwtico); n_obs <- seq_along(cs)
+ma <- ifelse(n_obs > 30, (cs - c(rep(0, 30), head(cs, -30))) / 30, cs / n_obs)
+C$oil <- ma[pmax(1L, findInterval(cal$date, o$date))]
+
+# Single holiday flag and make-up workdays (storesales.rmd definition)
+hc <- make_holiday_calendar(stores, holidays_events, dates)
+m  <- match(paste(cal$date, cal$store_nbr), paste(hc$date, hc$store_nbr))
+C$hol_coarse <- hc$holiday[m]
+C$workday    <- hc$workday[m]
+
+# Detailed holidays
+ev <- holidays_events[!is.na(holidays_events$transferred) &
+  tolower(as.character(holidays_events$transferred)) == "false", ]
+flag <- function(rows) {
+  out <- integer(nrow(cal))
+  for (i in seq_len(nrow(rows))) {
+    st <- switch(rows$locale[i], National = stores$store_nbr,
+      Regional = stores$store_nbr[stores$state == rows$locale_name[i]],
+      Local = stores$store_nbr[stores$city == rows$locale_name[i]], integer())
+    out[cal$date == rows$date[i] & cal$store_nbr %in% st] <- 1L
+  }
+  out
+}
+nat_names <- c(carnaval = "Carnaval", viernes_santo = "Viernes Santo",
+  trabajo = "Dia del Trabajo", pichincha = "Batalla de Pichincha",
+  primer_grito = "Primer Grito de Independencia", guayaquil = "Independencia de Guayaquil",
+  difuntos = "Dia de Difuntos", cuenca = "Independencia de Cuenca")
+nat <- ev[ev$locale == "National" & ev$type %in% c("Holiday", "Transfer"), ]
+nat$name <- sub("^Traslado ", "", nat$description)
+for (k in names(nat_names)) C[[paste0("nat_", k)]] <- flag(nat[nat$name == nat_names[k], ])
+C$bridge    <- flag(ev[ev$type == "Bridge", ])
+C$local_hol <- flag(ev[ev$locale %in% c("Regional", "Local") &
+  ev$type %in% c("Holiday", "Transfer", "Additional", "Bridge"), ])
+
+# Christmas and New Year
+md <- format(cal$date, "%m-%d")
+C$season <- as.integer(md %in% c(sprintf("12-%02d", 16:24), "12-26", "12-30", "12-31", "01-02", "01-03"))
+C$jan1   <- as.integer(md == "01-01")
+
+# Mother's Day, earthquake, unrecorded promotions
+C$mothers      <- flag(ev[ev$type == "Event" & ev$description == "Dia de la Madre", ])
+C$quake_nat    <- as.integer(cal$date >= as.Date("2016-04-16") & cal$date <= as.Date("2016-04-22"))
+C$quake_manabi <- as.integer(cal$date >= as.Date("2016-04-16") & cal$date <= as.Date("2016-06-10") &
+  cal_state == "Manabi")
+C$promo_gap    <- as.integer(cal$date < as.Date("2014-04-01"))
+
+C <- as.matrix(C)
+cal_key <- paste(cal$date, cal$store_nbr)
+```
+
+A specification is the Fourier count `K`, whether oil and paydays are in,
+and which default blocks are in:
+
+```{r spec}
+spec_cols <- function(spec) {
+  b <- spec$blocks
+  c("trend", paste0("wd", 2:7), "promo",
+    as.vector(rbind(paste0("sin", seq_len(spec$K)), paste0("cos", seq_len(spec$K)))),
+    if (spec$oil) "oil",
+    if (spec$payday) c("payday15", "payday_end"),
+    if ("holidays" %in% b) c(paste0("nat_", names(nat_names)), "bridge", "workday", "local_hol")
+      else c("hol_coarse", "workday"),
+    if ("christmas" %in% b) c("season", "jan1"),
+    if ("mothers" %in% b) "mothers",
+    if ("quake" %in% b) c("quake_nat", "quake_manabi"),
+    if ("promo_gap" %in% b) "promo_gap")
+}
+spec_label <- function(spec) paste0("K=", spec$K, if (spec$oil) ", oil", if (spec$payday) ", paydays",
+  "; blocks: ", if (length(spec$blocks)) paste(spec$blocks, collapse = ", ") else "none")
+spec_id <- function(spec, pool, origin, start) paste(pool, format(start, "%Y"), format(origin),
+  paste0("K", spec$K), if (spec$oil) "oil" else "nooil", if (spec$payday) "pay" else "nopay",
+  if (length(spec$blocks)) paste(sort(spec$blocks), collapse = "-") else "none", sep = "_")
+```
+
+# 4. Modelling data
+
+The panel holds the training rows from 2013 and the Kaggle test rows (sales
+unknown), so the same code later produces the submission. In each run, a
+series' rows before its first sale up to the training cut-off are excluded
+from fitting.
+
+```{r panel}
+panel <- rbind(train[train$date >= start_full, c("id", "date", "store_nbr", "family", "sales", "onpromotion")],
+  data.frame(test[, c("id", "date", "store_nbr", "family")], sales = NA_real_, onpromotion = test$onpromotion))
+panel$key <- paste(panel$store_nbr, panel$family, sep = " | ")
+panel$z   <- log1p(panel$sales)
+panel$ci  <- match(paste(panel$date, panel$store_nbr), cal_key)
+stopifnot(!anyNA(panel$ci))
+family_rows <- split(seq_len(nrow(panel)), panel$family)
+
+build_X <- function(rows, cols) {
+  X <- C[panel$ci[rows], setdiff(cols, "promo"), drop = FALSE]
+  if ("promo" %in% cols) X <- cbind(X, promo = log1p(panel$onpromotion[rows]))
+  X
+}
+```
+
+# 5. Model
+
+Same two-stage model as `holdout.Rmd`. For series $s$ on day $t$, with
+$z = \log(1 + \text{sales})$:
+
+$$z_{s,t} = a_s + b_{g(s)}^\top x_{s,t} + n_{s,t}$$
+
+Stage 1 estimates $a_s$ and $b_g$ by least squares on series-demeaned data,
+with $b$ per series, per family or global. Stage 2 fits `auto.arima` (weekly
+period) to each series' residuals, with the missing December 25 values
+interpolated. Fallback rules follow `storesales.rmd`: zero for series with
+no sales or no sales in the last 91 days (at least a year of mostly zeros, no
+promotions ahead); last value per weekday for fewer than 60 days of history
+or a failed fit.
+
+```{r stage1}
+fit_b <- function(X, z) { b <- lm.fit(X, z)$coefficients; b[is.na(b)] <- 0; b }
+
+stage1 <- function(cols, pool, origin, start) {
+  pos <- panel$date <= origin & !is.na(panel$sales) & panel$sales > 0
+  first_sale <- tapply(as.numeric(panel$date[pos]), panel$key[pos], min)
+  fs <- first_sale[panel$key]                                  # NA if no sale by the cut-off
+  train_mask <- panel$date >= start & panel$date <= origin & !is.na(fs) & as.numeric(panel$date) >= fs
+  test_mask  <- panel$date > origin & panel$date <= origin + h
+  prep <- function(f) {
+    rows <- family_rows[[f]]
+    i <- rows[train_mask[rows]]; j <- rows[test_mask[rows]]
+    if (!length(i)) return(NULL)
+    Xi <- build_X(i, cols); g <- panel$key[i]
+    n  <- rowsum(rep(1, length(i)), g)[, 1]
+    mx <- rowsum(Xi, g) / n; mz <- rowsum(panel$z[i], g)[, 1] / n
+    ig <- match(g, names(n))
+    list(i = i, j = j, g = g, gj = panel$key[j], mx = mx, mz = mz,
+         Xd = Xi - mx[ig, , drop = FALSE], zd = panel$z[i] - mz[ig], Xj = build_X(j, cols))
+  }
+  if (pool == "global") {                                      # one regression over all families
+    XtX <- 0; Xtz <- 0
+    for (f in names(family_rows)) {
+      blk <- prep(f); if (is.null(blk)) next
+      XtX <- XtX + crossprod(blk$Xd); Xtz <- Xtz + crossprod(blk$Xd, blk$zd)
+    }
+    b_all <- as.vector(qr.coef(qr(XtX), Xtz)); b_all[is.na(b_all)] <- 0
+  }
+  e <- r <- rep(NA_real_, nrow(panel))
+  for (f in names(family_rows)) {
+    blk <- prep(f); if (is.null(blk)) next
+    if (pool == "family") b_fam <- fit_b(blk$Xd, blk$zd)
+    si <- split(seq_along(blk$g), blk$g); sj <- split(seq_along(blk$gj), blk$gj)
+    for (k in names(si)) {
+      ii <- si[[k]]
+      b <- switch(pool, series = fit_b(blk$Xd[ii, , drop = FALSE], blk$zd[ii]), family = b_fam, global = b_all)
+      e[blk$i[ii]] <- blk$zd[ii] - as.vector(blk$Xd[ii, , drop = FALSE] %*% b)
+      jj <- sj[[k]]
+      if (length(jj)) r[blk$j[jj]] <- blk$mz[[k]] +
+        as.vector(sweep(blk$Xj[jj, , drop = FALSE], 2, blk$mx[k, ]) %*% b)
+    }
+  }
+  list(e = e, r = r, train_mask = train_mask, test_mask = test_mask)
+}
+```
+
+```{r stage2}
+complete_residuals <- function(e, d) {
+  full <- seq(min(d), max(d), by = "day")                      # every calendar day, including absent ones
+  forecast::na.interp(ts(e[match(full, d)], frequency = 7))
+}
+
+weekday_naive <- function(y, d, d_new) {
+  out <- rep(tail(y, 1), length(d_new))
+  for (j in seq_along(d_new)) {
+    v <- y[as.integer(d) %% 7L == as.integer(d_new[j]) %% 7L]
+    if (length(v)) out[j] <- tail(v, 1)
+  }
+  out
+}
+
+stage2_job <- function(j) {
+  y <- j$y; n_te <- length(j$d_te)
+  if (!length(y) || all(y == 0)) return(rep(0, n_te))
+  inactive <- length(y) >= 365 && mean(y == 0) >= 0.9 && all(tail(y, 91) == 0) && all(j$promo_te == 0)
+  if (inactive) return(rep(0, n_te))
+  if (length(y) < 60) return(weekday_naive(y, j$d_tr, j$d_te))
+  tryCatch({
+    e   <- complete_residuals(j$e, j$d_tr)
+    fit <- forecast::auto.arima(e, max.p = 2, max.q = 2, max.P = 1, max.Q = 1,
+      max.d = 1, max.D = 1, allowdrift = FALSE)
+    ef  <- as.numeric(forecast::forecast(fit, h = h)$mean)
+    pmax(0, expm1(j$r + ef[as.integer(j$d_te - j$origin)]))
+  }, error = function(err) weekday_naive(y, j$d_tr, j$d_te))
+}
+
+cl <- parallel::makePSOCKcluster(min(workers, parallel::detectCores()))
+parallel::clusterExport(cl, c("h", "complete_residuals", "weekday_naive", "stage2_job"))
+```
+
+# 6. Running and scoring
+
+```{r run}
+run_one <- function(spec, pool, origin, start) {
+  file <- file.path(cache_dir, paste0(spec_id(spec, pool, origin, start), ".rds"))
+  if (file.exists(file)) return(readRDS(file))
+  t0 <- proc.time()[3]
+  s1 <- stage1(spec_cols(spec), pool, origin, start)
+  tr <- split(which(s1$train_mask), panel$key[s1$train_mask])
+  te <- split(which(s1$test_mask), panel$key[s1$test_mask])
+  jobs <- lapply(names(te), function(k) {
+    i <- tr[[k]]; j <- te[[k]]
+    list(y = panel$sales[i], d_tr = panel$date[i], e = s1$e[i], d_te = panel$date[j],
+         promo_te = panel$onpromotion[j], r = s1$r[j], origin = origin, rows = j)
+  })
+  pred <- unlist(parallel::parLapply(cl, jobs, stage2_job))
+  rows <- unlist(lapply(jobs, `[[`, "rows"))
+  out <- data.frame(id = panel$id[rows], key = panel$key[rows], family = panel$family[rows],
+                    date = panel$date[rows], actual = panel$sales[rows], pred = pred)
+  saveRDS(out, file)
+  cat(spec_id(spec, pool, origin, start), ":", round((proc.time()[3] - t0) / 60, 1), "min\n", file = stderr())
+  out
+}
+
+rmsle <- function(d) sqrt(mean((log1p(d$pred) - log1p(d$actual))^2))
+
+score <- function(spec, pool, start) {
+  res <- lapply(origins, function(o) run_one(spec, pool, o, start))
+  c(pooled = rmsle(do.call(rbind, res)), w1 = rmsle(res[[1]]), w2 = rmsle(res[[2]]))
+}
+```
+
+Every series is scored, including those that never sold (forecast as zero).
+
+# 7. A1: Fourier pairs, oil and paydays
+
+All 12 combinations, with every default block included, for each structure.
+The lowest pooled RMSLE is kept.
+
+```{r a1, results='asis'}
+grid <- expand.grid(K = 1:3, oil = c(TRUE, FALSE), payday = c(TRUE, FALSE))
+best_spec <- list(); a1 <- list()
+for (p in pools) {
+  sc <- t(sapply(seq_len(nrow(grid)), function(i)
+    score(list(K = grid$K[i], oil = grid$oil[i], payday = grid$payday[i], blocks = blocks_all), p, start_full)))
+  a1[[p]] <- cbind(grid, sc)
+  b <- which.min(a1[[p]]$pooled)
+  best_spec[[p]] <- list(K = grid$K[b], oil = grid$oil[b], payday = grid$payday[b], blocks = blocks_all)
+}
+for (p in pools) {
+  print(knitr::kable(a1[[p]][order(a1[[p]]$pooled), ], digits = 4, row.names = FALSE,
+    caption = paste("A1:", p, "(w1 = window to July 30, w2 = window to August 15)")))
+  cat("\n\n")
+}
+```
+
+# 8. A2: default blocks
+
+Backward elimination: each remaining block is removed in turn; the removal
+with the largest improvement is made if it lowers the pooled RMSLE by more
+than 0.5% and lowers it in both windows. Repeat until no removal qualifies.
+
+```{r a2, results='asis'}
+a2 <- list()
+for (p in pools) {
+  cur <- best_spec[[p]]; cur_sc <- score(cur, p, start_full); steps <- list()
+  while (length(cur$blocks)) {
+    sc <- t(sapply(cur$blocks, function(b) {
+      s <- cur; s$blocks <- setdiff(cur$blocks, b); score(s, p, start_full) }))
+    tab <- data.frame(removed = cur$blocks, sc, row.names = NULL)
+    tab$improvement <- 1 - tab$pooled / cur_sc[["pooled"]]
+    tab$both_windows <- tab$w1 < cur_sc[["w1"]] & tab$w2 < cur_sc[["w2"]]
+    tab$drop <- tab$improvement > drop_rule & tab$both_windows
+    steps[[length(steps) + 1L]] <- tab
+    if (!any(tab$drop)) break
+    k <- which(tab$drop)[which.max(tab$improvement[tab$drop])]
+    cur$blocks <- setdiff(cur$blocks, tab$removed[k])
+    cur_sc <- unlist(tab[k, c("pooled", "w1", "w2")])
+  }
+  a2[[p]] <- steps; best_spec[[p]] <- cur
+}
+for (p in pools) for (s in seq_along(a2[[p]])) {
+  print(knitr::kable(a2[[p]][[s]], digits = 4,
+    caption = paste0("A2: ", p, ", step ", s, " (improvement relative to the current model)")))
+  cat("\n\n")
+}
+```
+
+# 9. A3: start date
+
+The selected specification is refitted from 2015. 2015 is adopted only if it
+lowers the pooled RMSLE by more than 2% and lowers it in both windows.
+
+```{r a3}
+a3 <- do.call(rbind, lapply(pools, function(p) {
+  s13 <- score(best_spec[[p]], p, start_full); s15 <- score(best_spec[[p]], p, start_late)
+  imp <- 1 - s15[["pooled"]] / s13[["pooled"]]
+  both <- s15[["w1"]] < s13[["w1"]] & s15[["w2"]] < s13[["w2"]]
+  data.frame(structure = p, pooled_2013 = s13[["pooled"]], pooled_2015 = s15[["pooled"]],
+             improvement = imp, both_windows = both, start = if (imp > start_rule && both) 2015L else 2013L)
+}))
+knitr::kable(a3, digits = 4, caption = "A3: start date")
+```
+
+# 10. Selected models
+
+```{r final}
+final <- lapply(pools, function(p) {
+  start <- if (a3$start[a3$structure == p] == 2015L) start_late else start_full
+  res <- do.call(rbind, lapply(origins, function(o) cbind(window = format(o), run_one(best_spec[[p]], p, o, start))))
+  list(structure = p, spec = best_spec[[p]], start = start, results = res)
+})
+names(final) <- pools
+knitr::kable(do.call(rbind, lapply(final, function(f) data.frame(structure = f$structure,
+  specification = spec_label(f$spec), start = format(f$start, "%Y"),
+  pooled = rmsle(f$results), w1 = rmsle(f$results[f$results$window == format(origins[1]), ]),
+  w2 = rmsle(f$results[f$results$window == format(origins[2]), ])))),
+  digits = 4, row.names = FALSE, caption = "Selected specification per structure")
+
+by_family <- sapply(final, function(f) {
+  sq <- (log1p(f$results$pred) - log1p(f$results$actual))^2
+  sqrt(tapply(sq, f$results$family, mean))
+})
+knitr::kable(by_family[order(-by_family[, "family"]), ], digits = 3,
+  caption = "Pooled RMSLE by product family, selected models")
+
+saveRDS(final, "selection_final.rds")
+```
+
+# 11. Kaggle submissions
+
+Each selected model is refitted on all training data (to August 15, from its
+selected start date) and forecasts the Kaggle test period, August 16 to 31.
+The per-family submission takes each product family's forecasts from the
+structure with the lowest holdout RMSLE for that family (table above).
+
+```{r submissions}
+final_origin <- max(train$date)
+write_submission <- function(res, file) {
+  res <- res[match(test$id, res$id), ]
+  stopifnot(identical(res$id, test$id), all(is.finite(res$pred)), all(res$pred >= 0))
+  write.csv(data.frame(id = res$id, sales = res$pred), file, row.names = FALSE)
+  res
+}
+subs <- list()
+for (p in pools) subs[[p]] <- write_submission(
+  run_one(final[[p]]$spec, p, final_origin, final[[p]]$start), paste0("submission_", p, ".csv"))
+
+family_choice <- setNames(colnames(by_family)[apply(by_family, 1, which.min)], rownames(by_family))
+per_family <- subs[[1]]
+for (p in pools) {
+  use <- family_choice[per_family$family] == p
+  per_family$pred[use] <- subs[[p]]$pred[use]
+}
+invisible(write_submission(per_family, "submission_per_family.csv"))
+
+knitr::kable(data.frame(family = names(family_choice), structure = unname(family_choice)),
+  row.names = FALSE, caption = "Structure used for each family in submission_per_family.csv")
+parallel::stopCluster(cl)
+```
+
+Files written: `submission_series.csv`, `submission_family.csv`,
+`submission_global.csv` and `submission_per_family.csv`.

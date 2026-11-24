@@ -1,0 +1,151 @@
+---
+title: "Store Sales: Model Comparison"
+author: "AMS 586"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+if (!requireNamespace("forecast", quietly = TRUE)) stop("Install package 'forecast'.")
+```
+
+# 1. Settings
+
+```{r settings}
+workers         <- as.integer(Sys.getenv("STORE_SALES_WORKERS", "4"))  # cores used by final_forecast
+lift_worker_cap <- TRUE                                    # see section 3
+h               <- 16L
+origins         <- as.Date(c("2017-07-14", "2017-07-30"))  # same windows as selection.Rmd
+starts          <- as.Date(c("2013-01-01", "2015-01-01"))
+cache_dir       <- "comparison_cache"                         # one file per run
+dir.create(cache_dir, showWarnings = FALSE)
+```
+
+The model of `storesales.rmd` is fitted on data up to each window's cut-off,
+from 2013 and from 2015, and forecasts the following 16 days. Each of the four
+runs is saved, so an interrupted knit resumes where it stopped.
+
+# 2. Data import
+
+Same loading step as `storesales.rmd`, including the Good Friday correction.
+
+```{r read-data}
+data_dir <- Sys.getenv("STORE_SALES_DATA", "store-sales-time-series-forecasting")
+if (!dir.exists(data_dir)) stop("Knit from the Kaggle folder containing the data directory.")
+csv_files <- sort(list.files(data_dir, pattern = "\\.csv$", full.names = TRUE))
+datasets <- setNames(lapply(csv_files, function(path) {
+  x <- read.csv(path, stringsAsFactors = FALSE)
+  if ("date" %in% names(x)) x$date <- as.Date(x$date)
+  x
+}), tools::file_path_sans_ext(basename(csv_files)))
+required <- c("train", "test", "stores", "oil", "holidays_events",
+              "transactions", "sample_submission")
+stopifnot(all(required %in% names(datasets)))
+train <- datasets$train; test <- datasets$test; stores <- datasets$stores
+holidays_events <- datasets$holidays_events
+# Data correction: Good Friday 2013 was March 29 (the file has April 29, a Monday)
+holidays_events$date[holidays_events$description == "Viernes Santo" &
+  holidays_events$date == as.Date("2013-04-29")] <- as.Date("2013-03-29")
+```
+
+# 3. Model functions
+
+The function definitions are read directly from the `modeling-configuration`
+chunk of `storesales.rmd`, so this file always uses the current version of
+that model. Only the definitions are run; the chunk's checks, which require
+training data to end on August 15, are skipped.
+
+`final_forecast` limits itself to 8 workers. With `lift_worker_cap <- TRUE`,
+that limit is removed in the copy loaded here (one expression,
+`min(workers, 8L, n)` becomes `min(workers, n)`); `storesales.rmd` itself is
+not changed and nothing else in the model is affected.
+
+```{r load-model}
+rmd <- readLines("storesales.rmd")
+first <- grep("^```\\{r modeling-configuration", rmd)
+last  <- first + grep("^```\\s*$", rmd[(first + 1L):length(rmd)])[1]
+chunk <- rmd[(first + 1L):(last - 1L)]
+if (lift_worker_cap) chunk <- sub("min(workers, 8L, n)", "min(workers, n)", chunk, fixed = TRUE)
+is_function_definition <- function(e) is.call(e) && as.character(e[[1]]) %in% c("<-", "=") &&
+  is.call(e[[3]]) && identical(e[[3]][[1]], as.name("function"))
+for (e in parse(text = chunk)) if (is_function_definition(e)) eval(e, envir = globalenv())
+stopifnot(exists("final_forecast"), exists("make_holiday_calendar"))
+
+holiday_calendar <- make_holiday_calendar(stores, holidays_events,
+  seq(as.Date("2013-01-01"), max(test$date), by = "day"))
+```
+
+For the 2015 runs, the training rows simply start in 2015. The model's
+history always begins on 2013-01-01, so the earlier days enter as missing
+sales, which its exact likelihood fits skip.
+
+# 4. Runs
+
+```{r runs}
+run_storesales <- function(origin, start) {
+  file <- file.path(cache_dir, paste0("storesales_", format(start, "%Y"), "_", format(origin), ".rds"))
+  if (file.exists(file)) return(readRDS(file))
+  tr <- train[train$date >= start & train$date <= origin, ]
+  te <- train[train$date > origin & train$date <= origin + h,
+              c("id", "date", "store_nbr", "family", "onpromotion", "sales")]
+  fit <- final_forecast(tr, te[, c("id", "date", "store_nbr", "family", "onpromotion")],
+                        holiday_calendar, workers = workers)
+  out <- data.frame(window = format(origin), key = paste(te$store_nbr, te$family, sep = " | "),
+                    family = te$family, date = te$date, actual = te$sales,
+                    pred = fit$submission$sales[match(te$id, fit$submission$id)])
+  saveRDS(out, file)
+  out
+}
+storesales_runs <- list()
+for (s in seq_along(starts)) {
+  res <- do.call(rbind, lapply(origins, run_storesales, start = starts[s]))
+  storesales_runs[[format(starts[s], "%Y")]] <- res
+}
+```
+
+# 5. Comparison
+
+All models are scored on the same rows: every series and day in both
+windows, including series that never sold. The three models from
+`selection.Rmd` are read from `selection_final.rds`.
+
+```{r compare}
+rmsle <- function(d) sqrt(mean((log1p(d$pred) - log1p(d$actual))^2))
+ours <- readRDS("selection_final.rds")
+models <- c(setNames(storesales_runs, paste0("storesales.rmd, from ", names(storesales_runs))),
+  setNames(lapply(ours, `[[`, "results"),
+           sapply(ours, function(f) paste0(f$structure, ", from ", format(f$start, "%Y")))))
+
+row_id <- function(d) paste(d$window, d$key, d$date)
+ref <- sort(row_id(models[[1]]))
+stopifnot(all(vapply(models, function(d) identical(sort(row_id(d)), ref), TRUE)))
+
+scores <- data.frame(model = names(models),
+  pooled = vapply(models, rmsle, 0),
+  w1 = vapply(models, function(d) rmsle(d[d$window == format(origins[1]), ]), 0),
+  w2 = vapply(models, function(d) rmsle(d[d$window == format(origins[2]), ]), 0),
+  row.names = NULL)
+knitr::kable(scores[order(scores$pooled), ], digits = 4, row.names = FALSE,
+  caption = "Holdout RMSLE (w1 = window to July 30, w2 = window to August 15)")
+
+by_family <- sapply(models, function(d) sqrt(tapply((log1p(d$pred) - log1p(d$actual))^2, d$family, mean)))
+knitr::kable(by_family[order(-by_family[, 1]), ], digits = 3, caption = "Pooled RMSLE by product family")
+
+saveRDS(models, "comparison_results.rds")
+```
+
+# 6. Kaggle submission from 2015
+
+The 2015 version did better on the holdout, so it is refitted on all
+training data from 2015 to August 15 and forecasts the Kaggle test period.
+`submission.csv` from `storesales.rmd` remains the 2013 version.
+
+```{r submission}
+sub_file <- "submission_storesales_2015.csv"
+if (!file.exists(sub_file)) {
+  fit <- final_forecast(train[train$date >= starts[2], ], test, holiday_calendar, workers = workers)
+  write.csv(fit$submission, sub_file, row.names = FALSE)
+}
+```

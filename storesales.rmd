@@ -24,6 +24,9 @@ header-includes:
   - \usepackage{booktabs}
   - \newsavebox{\reporttablebox}
   - \raggedbottom
+editor_options: 
+  markdown: 
+    wrap: 72
 ---
 
 ```{r setup, include=FALSE}
@@ -132,11 +135,12 @@ report_model_comparison <- function(detail) {
 
 # 1. Data and quality checks
 
-Daily sales are forecast for individual store-product-family combinations over
-August 16-31, 2017. All available training observations through August 15 are
-used for final fitting. Test data supply only identifiers, dates and known
-promotion counts; hidden test sales and unavailable future transactions/oil
-prices are not used. No validation split is introduced.
+Daily sales are forecast for individual store-product-family
+combinations over August 16-31, 2017. All available training
+observations through August 15 are used for final fitting. Test data
+supply only identifiers, dates and known promotion counts; hidden test
+sales and unavailable future transactions/oil prices are not used. No
+validation split is introduced.
 
 ```{r read-data, include=FALSE}
 data_dir <- Sys.getenv("STORE_SALES_DATA", "store-sales-time-series-forecasting")
@@ -152,6 +156,9 @@ required <- c("train", "test", "stores", "oil", "holidays_events",
 stopifnot(all(required %in% names(datasets)))
 train <- datasets$train; test <- datasets$test; stores <- datasets$stores
 oil <- datasets$oil; holidays_events <- datasets$holidays_events
+# Data correction: Good Friday 2013 was March 29 (the file has April 29, a Monday)
+holidays_events$date[holidays_events$description == "Viernes Santo" &
+  holidays_events$date == as.Date("2013-04-29")] <- as.Date("2013-03-29")
 transactions <- datasets$transactions; sample_submission <- datasets$sample_submission
 inventory <- data.frame(dataset = names(datasets),
   rows = vapply(datasets, nrow, integer(1)),
@@ -193,6 +200,7 @@ knitr::kable(id_duplicates, row.names = FALSE)
 if (duplicate_report$duplicate_key_rows[duplicate_report$dataset == "train"] > 0L)
   stop("Resolve duplicate training keys before continuing.")
 ```
+
 ```{r date-continuity, include=FALSE}
 dated_names <- names(datasets)[vapply(datasets, function(x) "date" %in% names(x), TRUE)]
 missing_dates <- setNames(lapply(dated_names, function(nm) {
@@ -228,11 +236,11 @@ report_table(report_coverage, "Date coverage and absent calendar dates", col.nam
 cat("**Absent training dates:** ", paste(as.character(missing_dates$train), collapse = ", "), ".\n\n", sep = "")
 ```
 
-The holiday table records events rather than a daily measurement process, and
-oil observations are not expected on every calendar date. Their absent-date
-counts are retained above, but exhaustive date lists do not identify additional
-data errors. Missing dates, missing recorded values and observed zeros are
-separate concepts throughout the analysis.
+The holiday table records events rather than a daily measurement
+process, and oil observations are not expected on every calendar date.
+Their absent-date counts are retained above, but exhaustive date lists
+do not identify additional data errors. Missing dates, missing recorded
+values and observed zeros are separate concepts throughout the analysis.
 
 ```{r aggregate-sales-and-completeness, include=FALSE}
 valid_identity <- complete.cases(train[c("date", "store_nbr", "family")])
@@ -274,6 +282,7 @@ cat("Regular analysis segment:", as.character(min(segment$date)), "through",
     "; dates outside segment =", segment$omitted, "\n")
 stopifnot(length(segment$value) >= 60)
 ```
+
 ```{r descriptive-statistics, include=FALSE}
 describe <- function(x) {
   omitted <- sum(is.na(x)); x <- x[!is.na(x)]
@@ -310,9 +319,10 @@ plot(daily_sales$date, daily_sales$sales, type = "l", col = "steelblue",
      main = "Daily Total Sales: All Stores and Families", xlab = "Date", ylab = "Sales (units)")
 ```
 
-The aggregate trajectory shows changing sales levels and pronounced calendar
-variation. Distributional and mean-variance comparisons motivate, but do not
-prove the adequacy of, a logarithmic transformation.
+The aggregate trajectory shows changing sales levels and pronounced
+calendar variation. Distributional and mean-variance comparisons
+motivate, but do not prove the adequacy of, a logarithmic
+transformation.
 
 ```{r sales-distribution-and-transformation, echo=FALSE, results='hide', fig.height=6.4}
 stopifnot(all(na.omit(daily_sales$sales) >= 0))
@@ -357,9 +367,10 @@ month_year_means$n_days <- month_year_counts$sales
 knitr::kable(month_year_means, digits = 2, row.names = FALSE)
 ```
 
-Weekday differences suggest weekly structure, examined with ACF/STL below.
-Monthly/yearly averages also mix trend, calendar composition and partial-year
-coverage, so they are descriptive rather than separate seasonal-effect estimates.
+Weekday differences suggest weekly structure, examined with ACF/STL
+below. Monthly/yearly averages also mix trend, calendar composition and
+partial-year coverage, so they are descriptive rather than separate
+seasonal-effect estimates.
 
 ```{r unusual-days-and-holidays, include=FALSE}
 # Tukey fences flag extremes, without declaring them errors or deleting them.
@@ -413,10 +424,11 @@ report_table(report_boundaries, "Year-boundary sales", digits = 1)
 cat(sprintf("Daily totals outside the 1.5-IQR fences: %d; **none were removed**. Event descriptions are abbreviated for display.\n\n", sum(flag)))
 ```
 
-Holiday matches contextualize unusually low/high sales without establishing
-causation or confirming errors. Transferred source dates and actual observances
-are distinguished in forecasting, and local/regional holidays apply only to
-relevant stores. Strong year-boundary drops are retained as genuine observations.
+Holiday matches contextualize unusually low/high sales without
+establishing causation or confirming errors. Transferred source dates
+and actual observances are distinguished in forecasting, and
+local/regional holidays apply only to relevant stores. Strong
+year-boundary drops are retained as genuine observations.
 
 ```{r promotions-and-sales, echo=FALSE, results='hide', fig.height=4.1}
 promo_ok <- complete.cases(daily_sales[c("sales", "promotion")])
@@ -439,8 +451,9 @@ cat(sprintf("The descriptive sales-promotion correlation is %.3f, using %d compl
 # 3. Trend, weekly seasonality and dependence
 
 For the regular aggregate segment, $z_t=\log(1+y_t)$ is decomposed as
-$z_t=T_t+S_t+R_t$ using robust weekly STL (frequency 7; seasonal window 13).
-Robust smoothing downweights unusual observations but does not delete them.
+$z_t=T_t+S_t+R_t$ using robust weekly STL (frequency 7; seasonal window
+13). Robust smoothing downweights unusual observations but does not
+delete them.
 
 ```{r aggregate-stl, echo=FALSE, results='hide', fig.keep=1, fig.height=6.2}
 y <- ts(segment$value, frequency = 7)
@@ -484,6 +497,7 @@ weekly_acf <- function(x) {
              approximate_bound = 1.96 / sqrt(length(x)))
 }
 ```
+
 ```{r aggregate-acf-pacf, echo=FALSE, results='hide', fig.height=3.9}
 plot_dependence(y, "Original aggregate")
 knitr::kable(weekly_acf(y), digits = 4)
@@ -496,27 +510,28 @@ report_table(data.frame(`Lag (days)` = c(7,14,21,28), Raw = weekly_acf(y)$acf,
   `Adjusted log` = weekly_acf(sa)$acf, check.names = FALSE), "Weekly-lag autocorrelations", digits = 3)
 ```
 
-Slow ACF decay is compatible with persistent dependence and changing levels;
-weekly-lag correlations complement the weekday plots. The plotted bounds are
-pointwise white-noise approximations, not multiplicity-adjusted seasonal tests.
-STL adjustment is estimated and itself changes the dependence structure.
+Slow ACF decay is compatible with persistent dependence and changing
+levels; weekly-lag correlations complement the weekday plots. The
+plotted bounds are pointwise white-noise approximations, not
+multiplicity-adjusted seasonal tests. STL adjustment is estimated and
+itself changes the dependence structure.
 
 # 4. Stationarity and series heterogeneity
 
-ADF tests $H_0$: a unit root. KPSS tests $H_0$: stationarity around the stated
-deterministic terms. Raw/log levels include an intercept and trend; differences
-use a constant. ADF lag selection allows at least four weeks, and both short and
-long KPSS bandwidths are retained to expose sensitivity.
+ADF tests $H_0$: a unit root. KPSS tests $H_0$: stationarity around the
+stated deterministic terms. Raw/log levels include an intercept and
+trend; differences use a constant. ADF lag selection allows at least
+four weeks, and both short and long KPSS bandwidths are retained to
+expose sensitivity.
 
-With deterministic terms included, the ADF regression has the form
-\[
+With deterministic terms included, the ADF regression has the form $$
 \Delta z_t=\alpha+\beta t+\gamma z_{t-1}
  +\sum_{j=1}^{p}\psi_j\Delta z_{t-j}+u_t,\qquad H_0:\gamma=0.
-\]
-The trend term is omitted for the constant-only specification. KPSS instead
-tests whether fluctuations around those deterministic terms are stationary;
-its long-run variance estimate depends on bandwidth. Short/long decisions
-are therefore reported together rather than as repeated independent evidence.
+$$ The trend term is omitted for the constant-only specification. KPSS
+instead tests whether fluctuations around those deterministic terms are
+stationary; its long-run variance estimate depends on bandwidth.
+Short/long decisions are therefore reported together rather than as
+repeated independent evidence.
 
 ```{r stationarity-test-helpers, include=FALSE}
 run_tests <- function(x, label, trend = TRUE) {
@@ -550,6 +565,7 @@ interpret_tests <- function(tab) {
   }
 }
 ```
+
 ```{r aggregate-stationarity-tests, include=FALSE}
 aggregate_tests <- rbind(run_tests(y, "Raw total", TRUE),
                          run_tests(z, "Log total", TRUE),
@@ -557,6 +573,7 @@ aggregate_tests <- rbind(run_tests(y, "Raw total", TRUE),
 knitr::kable(aggregate_tests, digits = 4, row.names = FALSE)
 interpret_tests(aggregate_tests)
 ```
+
 ```{r first-difference-diagnostics, include=FALSE}
 # A diagnostic comparison, not an automatic decision to difference.
 dsa <- diff(sa)
@@ -572,13 +589,14 @@ interpret_tests(difference_tests)
 report_stationarity(rbind(aggregate_tests, difference_tests), "Aggregate stationarity results")
 ```
 
-Rejecting ADF is evidence against a unit root; non-rejection is not proof of one.
-Disagreement with KPSS leaves uncertainty rather than proving stationarity.
-A deterministic-trend interpretation has mean-reverting shocks around a fixed
-trend; a stochastic trend permits persistent level shocks. First differences are
-a diagnostic alternative, not an automatic response to an increasing plot.
-Over-differencing can introduce negative short-lag correlation. Weekly
-seasonality alone does not require seasonal differencing.
+Rejecting ADF is evidence against a unit root; non-rejection is not
+proof of one. Disagreement with KPSS leaves uncertainty rather than
+proving stationarity. A deterministic-trend interpretation has
+mean-reverting shocks around a fixed trend; a stochastic trend permits
+persistent level shocks. First differences are a diagnostic alternative,
+not an automatic response to an increasing plot. Over-differencing can
+introduce negative short-lag correlation. Weekly seasonality alone does
+not require seasonal differencing.
 
 ```{r report-differenced-plots, fig.height=3.9}
 plot(segment$date[-1], as.numeric(dsa), type = "l", main = "Differenced adjusted log sales",
@@ -608,6 +626,7 @@ candidates <- candidates[order(candidates$mean, candidates$key), ]
 chosen <- candidates[unique(pmax(1, round(c(.2, .5, .9) * nrow(candidates)))), ]
 knitr::kable(chosen, digits = 3, row.names = FALSE)
 ```
+
 ```{r individual-series-diagnostics, include=FALSE}
 report_individual_details <- list()
 individual_tests <- list()
@@ -687,15 +706,17 @@ cat("ADF gives log/adjusted decisions; each KPSS pair gives short/long bandwidth
 report_stationarity(individual_tests[[chosen$key[1]]], "Detailed-series stationarity results")
 ```
 
-The detailed plots show one example; all three are analyzed in the source.
-Trend change is the endpoint difference in 28-day mean STL trend on log scale.
-All comparison metrics refer to their complete EDA segments. Seasonal strength is
-$F_S=\max\{0,1-\operatorname{Var}(R_t)/\operatorname{Var}(S_t+R_t)\}$,
-a descriptive variance ratio rather than a hypothesis test.
-Variation in these measures, zeros and stationarity decisions demonstrates why
-aggregate findings cannot be imposed on every store-family series. All regular
-EDA diagnostics use their complete contiguous segment; final model fitting uses
-the full history, not just the 365-observation exploratory segment.
+The detailed plots show one example; all three are analyzed in the
+source. Trend change is the endpoint difference in 28-day mean STL trend
+on log scale. All comparison metrics refer to their complete EDA
+segments. Seasonal strength is
+$F_S=\max\{0,1-\operatorname{Var}(R_t)/\operatorname{Var}(S_t+R_t)\}$, a
+descriptive variance ratio rather than a hypothesis test. Variation in
+these measures, zeros and stationarity decisions demonstrates why
+aggregate findings cannot be imposed on every store-family series. All
+regular EDA diagnostics use their complete contiguous segment; final
+model fitting uses the full history, not just the 365-observation
+exploratory segment.
 
 ```{r computed-summary, include=FALSE}
 cat(sprintf("- **Data quality:** %s missing training sales values; %s actual zero sales records retained. %s training calendar dates are absent. %s daily totals are unavailable or incomplete.\n",
@@ -714,6 +735,7 @@ cat(sprintf("- **Differencing:** adjusted-log first-difference ADF %s; KPSS reje
 cat(sprintf("- **Heterogeneity:** the selected store–family weekly seasonal strengths range from %.3f to %.3f; their zero fractions range from %.3f to %.3f. Assess models individually.\n",
   min(features$seasonal_strength), max(features$seasonal_strength), min(features$zero_fraction), max(features$zero_fraction)))
 ```
+
 ```{r segment-representativeness, include=FALSE}
 in_segment <- daily_sales$date %in% segment$date
 segment_comparison <- rbind(
@@ -727,24 +749,25 @@ knitr::kable(table(year = format(daily_sales$date, "%Y"), retained = in_segment)
 
 # 5. Forecasting features
 
-Write $Z_t=\log(1+Y_t)$. The regression features are linear time trend, weekday
-indicators, $\log(1+\mathrm{onpromotion})$, localized holiday/compensating-workday
-flags, payday indicators for the 15th/month end, and annual Fourier terms
-\[
+Write $Z_t=\log(1+Y_t)$. The regression features are linear time trend,
+weekday indicators, $\log(1+\mathrm{onpromotion})$, localized
+holiday/compensating-workday flags, payday indicators for the 15th/month
+end, and annual Fourier terms $$
 S_t=\sum_{k=1}^{K}\{a_k\sin(2\pi kt/365.25)+b_k\cos(2\pi kt/365.25)\},
 \qquad K\in\{1,2,3\}.
-\]
-Month ends include February/leap years. National events apply to all stores;
-regional/local events match state/city. Transferred source holidays are excluded
-and destination observances included. Binary event flags avoid duplicate joins.
-Unplanned events and unknown future transactions/oil prices are excluded. Store
-attributes are constant within a series and would duplicate its intercept.
+$$ Month ends include February/leap years. National events apply to all
+stores; regional/local events match state/city. Transferred source
+holidays are excluded and destination observances included. Binary event
+flags avoid duplicate joins. Unplanned events and unknown future
+transactions/oil prices are excluded. Store attributes are constant
+within a series and would duplicate its intercept.
 
-Full-history OLS BIC/AICc screens $K=1,2,3$. Their IID-error criteria are only
-screening proxies. The final comparison uses joint exact likelihood, comparing
-$K=1$ with the better higher-order screen at the winning error order. QR checks
-remove constants/aliases, including after differencing. Training and future
-matrices have identical columns and categorical encodings.
+Full-history OLS BIC/AICc screens $K=1,2,3$. Their IID-error criteria
+are only screening proxies. The final comparison uses joint exact
+likelihood, comparing $K=1$ with the better higher-order screen at the
+winning error order. QR checks remove constants/aliases, including after
+differencing. Training and future matrices have identical columns and
+categorical encodings.
 
 ```{r modeling-configuration, include=FALSE}
 # All model definitions are embedded below: no external R script required.
@@ -1384,104 +1407,112 @@ workers <- as.integer(Sys.getenv("STORE_SALES_WORKERS", as.character(default_wor
 cat("Full-history primary regression/SARIMA fitting; requested workers:", workers, "\n")
 ```
 
-All functions remain inside this R Markdown file and execute when knitted.
-Calendar/holiday features are cached per store; calendar matching replaces
-repeated merges. Missing targets remain NA. Missing promotions, if any, use that
-series' training-only median and are counted. No future sales are imputed or
-used in predictors. Known future promotion counts come from `test.csv`.
+All functions remain inside this R Markdown file and execute when
+knitted. Calendar/holiday features are cached per store; calendar
+matching replaces repeated merges. Missing targets remain NA. Missing
+promotions, if any, use that series' training-only median and are
+counted. No future sales are imputed or used in predictors. Known future
+promotion counts come from `test.csv`.
 
 # 6. Benchmark specifications
 
-The weekly seasonal-naive benchmark repeats the most recent observed training
-sale for each future weekday. If a weekday has no observations, it uses the
-last observed sale; an entirely unobserved history gives zero. This is a forecast
-rule, not zero-filling training data.
+The weekly seasonal-naive benchmark repeats the most recent observed
+training sale for each future weekday. If a weekday has no observations,
+it uses the last observed sale; an entirely unobserved history gives
+zero. This is a forecast rule, not zero-filling training data.
 
 OLS benchmarks use the same explanatory variables on log and raw scales:
-\[Z_t=\beta_0+\boldsymbol\beta^\top X_t+\varepsilon_t.\]
-Their standard errors are nominal when independence/homoskedasticity fail.
-Standalone SARIMA uses no external regressors:
-\[
+$$Z_t=\beta_0+\boldsymbol\beta^\top X_t+\varepsilon_t.$$ Their standard
+errors are nominal when independence/homoskedasticity fail. Standalone
+SARIMA uses no external regressors: $$
 \phi(B)\Phi(B^7)(1-B)^d(1-B^7)^D Z_t
 =c+\theta(B)\Theta(B^7)a_t.
-\]
-An intercept is allowed only without differencing; standalone drift is allowed
-only for $d=1,D=0$. OLS, standalone SARIMA and core-only regression/SARIMA are
-fitted on one illustrative series, not repeatedly across all series. They do
-not determine final forecasts through validation or cross-scale AIC comparisons.
+$$ An intercept is allowed only without differencing; standalone drift
+is allowed only for $d=1,D=0$. OLS, standalone SARIMA and core-only
+regression/SARIMA are fitted on one illustrative series, not repeatedly
+across all series. They do not determine final forecasts through
+validation or cross-scale AIC comparisons.
 
 # 7. Differencing and SARIMA identification
 
-AR($p$) models theoretically have PACF cutoffs and decaying ACF; MA($q$) models
-have ACF cutoffs and decaying PACF. ARMA patterns are typically mixed/decaying.
-Seasonal analogues occur at multiples of seven, but empirical patterns are
-ambiguous in finite samples.
+AR($p$) models theoretically have PACF cutoffs and decaying ACF; MA($q$)
+models have ACF cutoffs and decaying PACF. ARMA patterns are typically
+mixed/decaying. Seasonal analogues occur at multiples of seven, but
+empirical patterns are ambiguous in finite samples.
 
 The unchanged, bounded identification procedure is:
 
-1. Fit preliminary full-history regression to account for deterministic effects.
-   Use a complete adjusted segment for diagnostic tests. Select $D=1$ only when
-   adjusted seasonal strength and OCSB both support it, with remaining lag-seven
-   dependence; otherwise retain weekday effects and $D=0$.
-2. Choose $d=1$ only when raw deterministic-specification ADF/KPSS and the adjusted
-   KPSS screen jointly support it. Retain the deterministic trend otherwise.
-   Disagreements and structural-break caveats are recorded. Fitted-residual
-   screens are heuristics; ordinary ADF critical values are not used to claim
-   cointegration from OLS residuals.
-3. Propose an error order with at most 18 low-dimensional stepwise fits, bounded
-   by $0\le p,q\le2$ and $0\le P,Q\le1$. Retain the original anchor orders
-   $(p,q,P,Q)=(1,0,1,0),(0,1,0,1),(1,1,0,1)$ and remove duplicates.
-4. Refit eligible candidates jointly by exact maximum likelihood on **all
-   historical observations**, retaining calendar gaps as NA. Compare Fourier
-   dimension at the winning error order. If both lag-14/28 innovation tests
-   reject, consider one unused neighboring order guided by short-lag ACF/PACF.
-   The cap remains six distinct joint candidates plus logged convergence retries.
+1.  Fit preliminary full-history regression to account for deterministic
+    effects. Use a complete adjusted segment for diagnostic tests.
+    Select $D=1$ only when adjusted seasonal strength and OCSB both
+    support it, with remaining lag-seven dependence; otherwise retain
+    weekday effects and $D=0$.
+2.  Choose $d=1$ only when raw deterministic-specification ADF/KPSS and
+    the adjusted KPSS screen jointly support it. Retain the
+    deterministic trend otherwise. Disagreements and structural-break
+    caveats are recorded. Fitted-residual screens are heuristics;
+    ordinary ADF critical values are not used to claim cointegration
+    from OLS residuals.
+3.  Propose an error order with at most 18 low-dimensional stepwise
+    fits, bounded by $0\le p,q\le2$ and $0\le P,Q\le1$. Retain the
+    original anchor orders $(p,q,P,Q)=(1,0,1,0),(0,1,0,1),(1,1,0,1)$ and
+    remove duplicates.
+4.  Refit eligible candidates jointly by exact maximum likelihood on
+    **all historical observations**, retaining calendar gaps as NA.
+    Compare Fourier dimension at the winning error order. If both
+    lag-14/28 innovation tests reject, consider one unused neighboring
+    order guided by short-lag ACF/PACF. The cap remains six distinct
+    joint candidates plus logged convergence retries.
 
-For $k$ estimated parameters and $n$ effective observations,
-\[
+For $k$ estimated parameters and $n$ effective observations, $$
 \mathrm{AICc}=-2\ell+2k+\frac{2k(k+1)}{n-k-1},\qquad
 \mathrm{BIC}=-2\ell+k\log n.
-\]
+$$
 
-AICc is the primary penalized-likelihood criterion; BIC supplies a stronger
-complexity penalty. Comparisons require the same response data, differencing
-and likelihood convention. Approximate screening scores are not presented as
-exact joint likelihoods, and this coordinate search is not a global optimum
-claim. No model is selected merely because it passes a residual test.
+AICc is the primary penalized-likelihood criterion; BIC supplies a
+stronger complexity penalty. Comparisons require the same response data,
+differencing and likelihood convention. Approximate screening scores are
+not presented as exact joint likelihoods, and this coordinate search is
+not a global optimum claim. No model is selected merely because it
+passes a residual test.
 
 # 8. Regression with SARIMA errors and computation
 
-The primary specification is
-\[
+The primary specification is $$
 Z_t=\beta_0+\boldsymbol\beta^\top X_t+N_t,\qquad
 \phi(B)\Phi(B^7)(1-B)^d(1-B^7)^D N_t
 =\theta(B)\Theta(B^7)a_t.
-\]
-Regression coefficients and error parameters are estimated jointly. When
-$d+D>0$ the explicit trend is removed; seasonal differencing also removes
-weekday dummies. No redundant drift is added. Forecasts cover all 16 future
-days without observing intervening sales. Back-transformation is
-$\max\{0,\exp(\widehat Z)-1\}$, appropriate to the conditional log-scale target
-under RMSLE; it is not claimed to be an unbiased original-scale conditional mean.
+$$ Regression coefficients and error parameters are estimated jointly.
+When $d+D>0$ the explicit trend is removed; seasonal differencing also
+removes weekday dummies. No redundant drift is added. Forecasts cover
+all 16 future days without observing intervening sales.
+Back-transformation is $\max\{0,\exp(\widehat Z)-1\}$, appropriate to
+the conditional log-scale target under RMSLE; it is not claimed to be an
+unbiased original-scale conditional mean.
 
-Converged fits must have finite coefficients/uncertainty, positive innovation
-variance, stationary AR and invertible MA components. Warm starts may reuse
-ARMA coefficients, never fixed OLS regression estimates. Failed starts receive
-a cold retry; invalid candidates/forecasts are rejected and logged.
+Converged fits must have finite coefficients/uncertainty, positive
+innovation variance, stationary AR and invertible MA components. Warm
+starts may reuse ARMA coefficients, never fixed OLS regression
+estimates. Failed starts receive a cold retry; invalid
+candidates/forecasts are rejected and logged.
 
 Fallbacks remain explicit and unchanged:
 
-- All-zero histories give zero; positive constants give their constant value.
-- Recent-inactivity zero forecasts require at least 365 observed days, a past
-  positive sale, at least 90% historical zeros, 91 consecutive observed zero days
-  at the end, and completely observed zero future promotions. Known future
-  promotion activity vetoes this rule; unpromoted reactivation remains a risk.
-- Fewer than 60 observations use seasonal naive. If joint fitting fails, use
-  seasonal naive or, for at least 80% zeros, a full-history log-weekday mean.
+- All-zero histories give zero; positive constants give their constant
+  value.
+- Recent-inactivity zero forecasts require at least 365 observed days, a
+  past positive sale, at least 90% historical zeros, 91 consecutive
+  observed zero days at the end, and completely observed zero future
+  promotions. Known future promotion activity vetoes this rule;
+  unpromoted reactivation remains a risk.
+- Fewer than 60 observations use seasonal naive. If joint fitting fails,
+  use seasonal naive or, for at least 80% zeros, a full-history
+  log-weekday mean.
 
-Genuine zeros remain observed, small positive predictions are not rounded to
-zero, and unusual observations are not deleted. Finite extrapolations are flagged
-rather than capped; overflow/nonfinite predictions cause a fallback.
+Genuine zeros remain observed, small positive predictions are not
+rounded to zero, and unusual observations are not deleted. Finite
+extrapolations are flagged rather than capped; overflow/nonfinite
+predictions cause a fallback.
 
 ```{r full-training-and-submission, include=FALSE}
 run_start <- proc.time()[3]
@@ -1501,6 +1532,7 @@ cat("Final submission rows:", nrow(submission), "\n")
 knitr::kable(as.data.frame(table(final$models$model)),
              col.names = c("Selected model", "Number of series"), row.names = FALSE)
 ```
+
 ```{r fitting-progress-summary, include=FALSE}
 knitr::kable(final$progress, digits = 1, row.names = FALSE)
 cat("Total exact ML calls:", sum(final$models$ML_calls), "\n")
@@ -1517,24 +1549,24 @@ report_table(data.frame(Quantity = c("Series processed", "Successful joint-model
  "Final computational summary", digits = 1)
 ```
 
-Console progress remains active. Parallel execution uses reproducible PSOCK
-workers, fixed series order and RNG streams; the default is at most two detected
-physical cores, with explicit requests capped at eight. Worker-startup failure
-falls back to sequential execution. Cumulative per-series fitting time differs
-from wall time under parallel execution.
+Console progress remains active. Parallel execution uses reproducible
+PSOCK workers, fixed series order and RNG streams; the default is at
+most two detected physical cores, with explicit requests capped at
+eight. Worker-startup failure falls back to sequential execution.
+Cumulative per-series fitting time differs from wall time under parallel
+execution.
 
 # 9. Representative model adequacy
 
 For one-step innovations, the Ljung-Box null is
-$H_0:\rho_a(1)=\cdots=\rho_a(h)=0$, with
-\[
+$H_0:\rho_a(1)=\cdots=\rho_a(h)=0$, with $$
 Q=n(n+2)\sum_{k=1}^{h}\frac{\widehat\rho_a(k)^2}{n-k}.
-\]
-At lags 14/28 the ARIMA reference is approximately
-$\chi^2_{h-p-q-P-Q}$. Regression coefficients and differencing are not counted
-as ARMA parameters. OLS uses a descriptive `fitdf=0` screen rather than an exact
-regression-adjusted test. Failing to reject does not prove white noise; many
-series/tests also create multiplicity concerns.
+$$ At lags 14/28 the ARIMA reference is approximately
+$\chi^2_{h-p-q-P-Q}$. Regression coefficients and differencing are not
+counted as ARMA parameters. OLS uses a descriptive `fitdf=0` screen
+rather than an exact regression-adjusted test. Failing to reject does
+not prove white noise; many series/tests also create multiplicity
+concerns.
 
 ```{r detailed-coefficients-and-diagnostics, include=FALSE}
 detail <- final$detail
@@ -1602,11 +1634,12 @@ if (!is.null(detail) && !is.null(detail$primary$fit)) {
 }
 ```
 
-For binary regressors, coefficients are conditional shifts in log(1 + sales);
-$\exp(\beta)-1$ expresses a proportional change in that transformed conditional
-level. These are associations, not causal promotion/holiday effects. Nominal
-coefficient tests are approximate and become less reliable with remaining
-innovation dependence; they are not used to delete terms automatically.
+For binary regressors, coefficients are conditional shifts in log(1 +
+sales); $\exp(\beta)-1$ expresses a proportional change in that
+transformed conditional level. These are associations, not causal
+promotion/holiday effects. Nominal coefficient tests are approximate and
+become less reliable with remaining innovation dependence; they are not
+used to delete terms automatically.
 
 ```{r report-primary-residual-plots, fig.height=6.1}
 if (!is.null(detail) && !is.null(detail$primary$fit)) {
@@ -1647,12 +1680,13 @@ if (!is.null(detail) && !is.null(detail$primary$fit)) {
 }
 ```
 
-These plots retain evidence of autocorrelation, variance changes and unusual
-innovations. Gaussianity is stronger than white noise, and a squared-innovation
-test is only a variance-dependence screen, not definitive ARCH identification.
-Internal missing residuals are not concatenated: ACF/PACF and tests use a
-contiguous complete residual segment. Integrated roots are intentional and
-excluded from ARMA stationarity/invertibility checks.
+These plots retain evidence of autocorrelation, variance changes and
+unusual innovations. Gaussianity is stronger than white noise, and a
+squared-innovation test is only a variance-dependence screen, not
+definitive ARCH identification. Internal missing residuals are not
+concatenated: ACF/PACF and tests use a contiguous complete residual
+segment. Integrated roots are intentional and excluded from ARMA
+stationarity/invertibility checks.
 
 ```{r training-only-differencing-review, include=FALSE}
 if (!is.null(detail)) {
@@ -1705,6 +1739,7 @@ if (any(finite_p)) {
       round(mean(model_summary$LjungBox_p14[finite_p] < 0.05), 3), "\n")
 }
 ```
+
 ```{r selected-specification-and-fallback-summary, include=FALSE}
 knitr::kable(as.data.frame(table(model_summary$d, model_summary$D)),
   col.names = c("d", "D", "Number of series"), row.names = FALSE)
@@ -1721,6 +1756,7 @@ cat("Actual rows with missing sales:", sum(model_summary$missing_sales_rows), "\
 methods <- as.data.frame(table(model_summary$model, model_summary$failure))
 knitr::kable(methods[methods$Freq > 0, ], col.names = c("Method", "Fallback reason", "Series"), row.names = FALSE)
 ```
+
 ```{r all-series-ljung-box-summary, include=FALSE}
 if (!is.null(final$diagnostics) && nrow(final$diagnostics)) {
   knitr::kable(aggregate(reject_5pct ~ lag, final$diagnostics, mean), digits = 3, row.names = FALSE)
@@ -1761,25 +1797,24 @@ if (nrow(report_unresolved)) report_table(head(report_unresolved[c("series", "mo
  cat("No numerical fitting failures forced a series-level fallback; the zero/inactivity rules remain separate from recovered numerical failures.\n\n")
 ```
 
-The nontrivial rejection rates above remain evidence of incomplete innovation
-whitening, not a reason to claim model adequacy. Diagnostic flags and valid
-unusual observations are retained. AICc/BIC and in-sample tests cannot establish
-16-day forecast accuracy; structural changes, intermittent sales, holiday
-irregularities and unpromoted reactivation remain limitations.
+The nontrivial rejection rates above remain evidence of incomplete
+innovation whitening, not a reason to claim model adequacy. Diagnostic
+flags and valid unusual observations are retained. AICc/BIC and
+in-sample tests cannot establish 16-day forecast accuracy; structural
+changes, intermittent sales, holiday irregularities and unpromoted
+reactivation remain limitations.
 
 # 11. Kaggle forecasts
 
 The horizon is **August 16-31, 2017**. The existing export writes only
-`submission.csv`, with exactly `id,sales`, in original test order. No upload is
-performed and no hidden target values are used.
+`submission.csv`, with exactly `id,sales`, in original test order. No
+upload is performed and no hidden target values are used.
 
-Kaggle evaluates predictions using
-\[
+Kaggle evaluates predictions using $$
 \mathrm{RMSLE}=\sqrt{\frac1n\sum_{i=1}^{n}
  [\log(1+\widehat Y_i)-\log(1+Y_i)]^2}.
-\]
-This metric motivates the log-scale target but cannot be calculated for the
-hidden test outcomes inside the report.
+$$ This metric motivates the log-scale target but cannot be calculated
+for the hidden test outcomes inside the report.
 
 ```{r submission-inspection, include=FALSE}
 cat("Final prediction count:", nrow(submission), "\n")
@@ -1797,20 +1832,24 @@ report_table(head(submission, 3), "Submission preview", digits = 4)
 
 # 12. Conclusions and reproducibility
 
-- Sales levels, weekday effects and variance vary over time; log1p compresses
-  large values without discarding observed zeros. Holiday/promotion associations
-  are contextual rather than causal.
-- Weekly dependence is supported by complementary calendar, STL and ACF evidence.
-  STL alone cannot identify a deterministic or stochastic trend.
-- ADF/KPSS disagreements and bandwidth sensitivity are retained. Differencing is
-  conservative and conditional on the specified deterministic components, not
-  an automatic response to upward trend or weekly seasonality.
-- Forecasts use joint regression with parsimonious SARIMA errors and all training
-  history. In-sample AICc drives a bounded search; BIC, convergence and root checks
-  supplement it. Explicit zero/inactivity/fitting fallbacks keep all series covered.
-- Remaining residual autocorrelation and variance instability qualify nominal
-  inference and model adequacy. A lower Kaggle RMSLE than the user-reported
-  baseline **0.47053** is not guaranteed; no new score is claimed.
+- Sales levels, weekday effects and variance vary over time; log1p
+  compresses large values without discarding observed zeros.
+  Holiday/promotion associations are contextual rather than causal.
+- Weekly dependence is supported by complementary calendar, STL and ACF
+  evidence. STL alone cannot identify a deterministic or stochastic
+  trend.
+- ADF/KPSS disagreements and bandwidth sensitivity are retained.
+  Differencing is conservative and conditional on the specified
+  deterministic components, not an automatic response to upward trend or
+  weekly seasonality.
+- Forecasts use joint regression with parsimonious SARIMA errors and all
+  training history. In-sample AICc drives a bounded search; BIC,
+  convergence and root checks supplement it. Explicit
+  zero/inactivity/fitting fallbacks keep all series covered.
+- Remaining residual autocorrelation and variance instability qualify
+  nominal inference and model adequacy. A lower Kaggle RMSLE than the
+  user-reported baseline **0.47053** is not guaranteed; no new score is
+  claimed.
 
 ```{r forecasting-session-information, include=FALSE}
 sessionInfo()
@@ -1822,10 +1861,13 @@ cat("**Packages:** ", paste(vapply(c("forecast", "urca", "knitr", "rmarkdown"),
  function(p) paste0(p, " ", as.character(packageVersion(p))), ""), collapse = "; "), ".\n\n", sep = "")
 ```
 
-All statistical and forecasting functions are retained in this one source file.
-A normal knit executes the full workflow and the single CSV export. Presentation
-summaries introduce no new forecasting rules. Method references:
+All statistical and forecasting functions are retained in this one
+source file. A normal knit executes the full workflow and the single CSV
+export. Presentation summaries introduce no new forecasting rules.
+Method references:
 [Arima](https://pkg.robjhyndman.com/forecast/reference/Arima.html),
-[order search](https://pkg.robjhyndman.com/forecast/reference/auto.arima.html),
-[ndiffs](https://pkg.robjhyndman.com/forecast/reference/ndiffs.html), and
+[order
+search](https://pkg.robjhyndman.com/forecast/reference/auto.arima.html),
+[ndiffs](https://pkg.robjhyndman.com/forecast/reference/ndiffs.html),
+and
 [nsdiffs](https://pkg.robjhyndman.com/forecast/reference/nsdiffs.html).
